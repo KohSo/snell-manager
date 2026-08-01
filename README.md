@@ -79,6 +79,12 @@ v6: 已安装[v6]且已启动
 - 旧配置没有 `tfo` 字段时，只输出 `reuse=true`，保留旧节点的简洁格式。
 - 新部署节点按 xOS 偏好输出 `reuse=true, tfo=true, ecn=true`。
 
+## 致谢
+
+本项目的 Snell 安装交互、默认选项和配置流程参考了 [xOS/Snell](https://github.com/xOS/Snell)。感谢 xOS 及其贡献者对 Snell 部署脚本的持续维护与开源分享。
+
+本项目是独立的 v5/v6 多实例管理实现，与 xOS/Snell 不属于同一项目，也不代表 xOS 对本项目的官方背书。
+
 ## 官方资料
 
 - [Snell 发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)
