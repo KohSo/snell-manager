@@ -20,6 +20,7 @@ RED='\033[31m'
 RESET='\033[0m'
 MENU_RULE='=============================='
 MENU_DIVIDER='——————————————————————————————'
+CONFIG_RULE='——————————————————————————————————————————————————'
 
 declare -a INST_UNIT=() INST_BIN=() INST_CONF=() INST_VERSION=() INST_MAJOR=()
 declare -a INST_PORT=() INST_LISTEN=() INST_ACTIVE=() INST_ENABLED=() INST_MANAGED=()
@@ -217,6 +218,24 @@ public_ipv4() {
   printf '%s' "$ip"
 }
 
+public_ipv6() {
+  local ip="" url
+  if command -v curl >/dev/null; then
+    for url in https://api64.ipify.org https://api6.ipify.org https://ifconfig.co/ip; do
+      ip=$(curl -6fsS --max-time 4 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+      [[ $ip == *:* ]] && break
+      ip=""
+    done
+  elif command -v wget >/dev/null; then
+    for url in https://api64.ipify.org https://api6.ipify.org https://ifconfig.co/ip; do
+      ip=$(wget -6qO- -T 4 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+      [[ $ip == *:* ]] && break
+      ip=""
+    done
+  fi
+  printf '%s' "$ip"
+}
+
 yes_no_value() {
   local value=$1 default=${2:-false}
   if [[ -z $value ]]; then
@@ -310,24 +329,60 @@ view_current_configs() {
   endpoint=$(public_ipv4)
   [[ -n $endpoint ]] || { warn "无法获取公网 IPv4，暂时不能生成 Surge 配置。"; return; }
   base=$(hostname)
-  printf '\n当前 Surge 配置：\n\n'
+  printf '\n%b%s%b\n当前 Surge 配置：\n\n' "$GREEN" "$CONFIG_RULE" "$RESET"
   for i in "${!INST_UNIT[@]}"; do
-    name=$base
-    ((count == 1)) || name="$base v${INST_MAJOR[$i]}"
+    name="$base v${INST_MAJOR[$i]}"
     summary_surge_line "$i" "$endpoint" "$name" || warn "${INST_UNIT[$i]} 缺少端口或 PSK，无法生成。"
     printf '\n'
   done
+  printf '\n%b%s%b\n\n%b* 按回车返回主菜单 *%b' "$GREEN" "$CONFIG_RULE" "$RESET" "$YELLOW" "$RESET"
+  read -r
 }
 
 view_instance() {
-  local i=$1
-  printf '\nSnell 实例配置：\n'
-  printf '服务: %s\n二进制: %s\n配置: %s\n状态: %s / %s\n' \
-    "${INST_UNIT[$i]}" "${INST_BIN[$i]}" "${INST_CONF[$i]}" \
-    "${INST_ACTIVE[$i]}" "${INST_ENABLED[$i]}"
-  printf '%s\n' "------------------------------------------------------------"
-  cat "${INST_CONF[$i]}"
-  printf '%s\n' "------------------------------------------------------------"
+  local i=$1 ipv4_addr ipv6_addr psk obfs obfs_host ipv6 tfo dns egress dns_pref mode endpoint line
+  ipv4_addr=$(public_ipv4)
+  ipv6_addr=$(public_ipv6)
+  psk=$(config_value "${INST_CONF[$i]}" psk)
+  obfs=$(config_value "${INST_CONF[$i]}" obfs)
+  obfs_host=$(config_value "${INST_CONF[$i]}" obfs-host)
+  ipv6=$(config_value "${INST_CONF[$i]}" ipv6)
+  tfo=$(config_value "${INST_CONF[$i]}" tfo)
+  dns=$(config_value "${INST_CONF[$i]}" dns)
+  egress=$(config_value "${INST_CONF[$i]}" egress-interface)
+  dns_pref=$(config_value "${INST_CONF[$i]}" dns-ip-preference)
+  mode=$(config_value "${INST_CONF[$i]}" mode)
+
+  printf '\n%bSnell Server 配置信息：%b\n%b%s%b\n' "$GREEN" "$RESET" "$GREEN" "$CONFIG_RULE" "$RESET"
+  [[ -z $ipv4_addr ]] || printf ' IPv4 地址\t: %b%s%b\n' "$GREEN" "$ipv4_addr" "$RESET"
+  [[ -z $ipv6_addr ]] || printf ' IPv6 地址\t: %b%s%b\n' "$GREEN" "$ipv6_addr" "$RESET"
+  printf ' 端口\t\t: %b%s%b\n' "$GREEN" "${INST_PORT[$i]}" "$RESET"
+  printf ' 密钥\t\t: %b%s%b\n' "$GREEN" "$psk" "$RESET"
+  if [[ ${INST_MAJOR[$i]} == 5 ]]; then
+    printf ' OBFS\t\t: %b%s%b\n' "$GREEN" "${obfs:-off}" "$RESET"
+    [[ $obfs != http || -z $obfs_host ]] || printf ' OBFS Host\t: %b%s%b\n' "$GREEN" "$obfs_host" "$RESET"
+    printf ' IPv6\t\t: %b%s%b\n' "$GREEN" "${ipv6:-false}" "$RESET"
+  fi
+  [[ -z $tfo ]] || printf ' TFO\t\t: %b%s%b\n' "$GREEN" "$tfo" "$RESET"
+  [[ -z $dns ]] || printf ' DNS\t\t: %b%s%b\n' "$GREEN" "$dns" "$RESET"
+  [[ -z $egress ]] || printf ' 出口网卡\t: %b%s%b\n' "$GREEN" "$egress" "$RESET"
+  if [[ ${INST_MAJOR[$i]} == 6 ]]; then
+    printf ' DNS IP 偏好\t: %b%s%b\n' "$GREEN" "${dns_pref:-default}" "$RESET"
+    printf ' mode\t\t: %b%s%b\n' "$GREEN" "${mode:-default}" "$RESET"
+  fi
+  printf ' 版本\t\t: %b%s%b\n' "$GREEN" "${INST_MAJOR[$i]}" "$RESET"
+  printf '%b%s%b\n' "$GREEN" "$CONFIG_RULE" "$RESET"
+  printf '%b[信息]%b Surge 配置：\n' "$GREEN" "$RESET"
+  endpoint=$ipv4_addr
+  [[ -n $endpoint ]] || endpoint=$ipv6_addr
+  if [[ -n $endpoint ]]; then
+    line=$(summary_surge_line "$i" "$endpoint" "$(hostname)")
+    printf '%s\n' "$line"
+  else
+    warn "无法获取公网 IP，暂时不能生成 Surge 配置。"
+  fi
+  printf '%b%s%b\n\n%b* 按回车返回主菜单 *%b' "$GREEN" "$CONFIG_RULE" "$RESET" "$YELLOW" "$RESET"
+  read -r
 }
 
 port_free() {
@@ -703,20 +758,10 @@ print_major_status() {
 }
 
 print_main_status() {
-  local i5="" i6=""
-  find_major_instance 5 && i5=$MAJOR_INDEX
-  find_major_instance 6 && i6=$MAJOR_INDEX
-  if [[ -z $i5 && -z $i6 ]]; then
-    printf '%b未安装 Snell v5/v6%b' "$RED" "$RESET"
-  elif [[ -n $i5 && -n $i6 && ${INST_ACTIVE[$i5]} == active && ${INST_ACTIVE[$i6]} == active ]]; then
-    printf '%b已安装%b%b[v5]%b & %b[v6]%b且%b已启动%b' \
-      "$GREEN" "$RESET" "$YELLOW" "$RESET" "$YELLOW" "$RESET" "$GREEN" "$RESET"
-  else
-    printf 'v5: '
-    print_major_status 5
-    printf ' | v6: '
-    print_major_status 6
-  fi
+  printf 'v5: '
+  print_major_status 5
+  printf '\n\t\tv6: '
+  print_major_status 6
 }
 
 major_menu() {
@@ -777,7 +822,7 @@ main_menu() {
     printf '\n%s\nSnell v5/v6 多实例管理器 v%s\n%s\n' "$MENU_RULE" "$SCRIPT_VERSION" "$MENU_RULE"
     printf '1.管理 Snell v5\n2.管理 Snell v6\n3.查看 当前配置\n'
     printf '%s\n 00. 退出脚本\n%s\n\n' "$MENU_DIVIDER" "$MENU_RULE"
-    printf ' 当前状态: '
+    printf ' 当前状态:\t'
     print_main_status
     printf '\n\n'
     read -r -p " 请输入数字[0-9]:" choice

@@ -98,11 +98,34 @@ assert_contains "$main_output" "3.查看 当前配置" "new main menu current co
 assert_contains "$main_output" "$MENU_RULE" "main menu xOS title rule"
 assert_contains "$main_output" "$MENU_DIVIDER" "main menu xOS divider"
 assert_contains "$main_output" "v5:" "mixed main status includes v5"
+assert_contains "$main_output" $'当前状态:\tv5:' "main status aligns v5 at tab stop"
+assert_contains "$main_output" $'\n\t\tv6:' "main status aligns v6 at same tab stop"
 major_output=$(printf '00\n' | major_menu 5)
 assert_contains "$major_output" "1.安装 Snell v5" "v5 management install entry"
 assert_contains "$major_output" "9.查看 运行状态" "version management status entry"
 assert_contains "$major_output" "$MENU_DIVIDER" "management uses xOS divider"
 assert_contains "$major_output" "00. 返回" "version management return entry"
+
+INST_UNIT=(snell-v5.service snell-v6.service)
+INST_CONF=("$tmp/summary-v5.conf" "$tmp/v6.conf")
+INST_PORT=(36894 37681)
+INST_MAJOR=(5 6)
+INST_ACTIVE=(active active)
+public_ipv4() { printf '203.0.113.10'; }
+public_ipv6() { printf '2001:db8::10'; }
+hostname() { printf 'VM-TEST'; }
+current_output=$(printf '\n' | view_current_configs)
+assert_contains "$current_output" "$CONFIG_RULE" "current config uses long rule"
+assert_contains "$current_output" "VM-TEST v5 = snell, 203.0.113.10, 36894" "current config renders v5 line"
+assert_contains "$current_output" "VM-TEST v6 = snell, 203.0.113.10, 37681" "current config renders v6 line"
+assert_contains "$current_output" $'ecn=true\n\n' "current config leaves blank line before footer"
+assert_contains "$current_output" "* 按回车返回主菜单 *" "current config return prompt"
+view_output=$(printf '\n' | view_instance 0)
+assert_contains "$view_output" "Snell Server 配置信息：" "instance configuration title"
+assert_contains "$view_output" $'IPv4 地址\t:' "instance configuration IPv4 field"
+assert_contains "$view_output" $'IPv6 地址\t:' "instance configuration IPv6 field"
+assert_contains "$view_output" "[信息]" "instance Surge information label"
+assert_contains "$view_output" "VM-TEST = snell, 203.0.113.10, 36894" "instance Surge line"
 
 if ((failures)); then
   printf '%s test(s) failed\n' "$failures" >&2
