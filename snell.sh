@@ -17,7 +17,12 @@ V6_AMD64_SHA256="02fa15ac1e18cde6a3e072eeb5d15328c7fd759dbefb1e77e33891a71a1202a
 GREEN='\033[32m'
 YELLOW='\033[33m'
 RED='\033[31m'
+RED_BG='\033[41;37m'
 RESET='\033[0m'
+MENU_RULE='=============================='
+INSTALL_RULE='=================================='
+MENU_DIVIDER='——————————————————————————————'
+CONFIG_RULE='——————————————————————————————————————————————————'
 
 declare -a INST_UNIT=() INST_BIN=() INST_CONF=() INST_VERSION=() INST_MAJOR=()
 declare -a INST_PORT=() INST_LISTEN=() INST_ACTIVE=() INST_ENABLED=() INST_MANAGED=()
@@ -25,6 +30,32 @@ declare -a INST_PORT=() INST_LISTEN=() INST_ACTIVE=() INST_ENABLED=() INST_MANAG
 info() { printf "%b[信息]%b %s\n" "$GREEN" "$RESET" "$*"; }
 warn() { printf "%b[提示]%b %s\n" "$YELLOW" "$RESET" "$*" >&2; }
 die() { printf "%b[错误]%b %s\n" "$RED" "$RESET" "$*" >&2; exit 1; }
+
+prompt_read() {
+  local variable=$1 prompt=$2
+  printf '%b' "$prompt"
+  IFS= read -r "$variable"
+}
+
+pause_management_menu() {
+  printf '%b%s%b\n\n%b* 按回车返回管理菜单 *%b' "$GREEN" "$CONFIG_RULE" "$RESET" "$YELLOW" "$RESET"
+  read -r
+}
+
+pause_main_menu() {
+  printf '%b%s%b\n\n%b* 按回车返回主菜单 *%b' "$GREEN" "$CONFIG_RULE" "$RESET" "$YELLOW" "$RESET"
+  read -r
+}
+
+print_install_result() {
+  local label=$1 value=$2
+  printf '\n%s\n%b%s %s%b\n%s\n\n' "$MENU_RULE" "$RED_BG" "$label" "$value" "$RESET" "$MENU_RULE"
+}
+
+cancel_install() {
+  info "已取消安装。"
+  pause_management_menu
+}
 
 require_root() {
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 或 sudo 运行。"
@@ -215,6 +246,24 @@ public_ipv4() {
   printf '%s' "$ip"
 }
 
+public_ipv6() {
+  local ip="" url
+  if command -v curl >/dev/null; then
+    for url in https://api64.ipify.org https://api6.ipify.org https://ifconfig.co/ip; do
+      ip=$(curl -6fsS --max-time 4 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+      [[ $ip == *:* ]] && break
+      ip=""
+    done
+  elif command -v wget >/dev/null; then
+    for url in https://api64.ipify.org https://api6.ipify.org https://ifconfig.co/ip; do
+      ip=$(wget -6qO- -T 4 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+      [[ $ip == *:* ]] && break
+      ip=""
+    done
+  fi
+  printf '%s' "$ip"
+}
+
 yes_no_value() {
   local value=$1 default=${2:-false}
   if [[ -z $value ]]; then
@@ -241,8 +290,8 @@ build_surge_line() {
   line="$name = snell, $(surge_endpoint "$endpoint"), $port, psk=$psk, version=$version"
   if [[ $version == 6 && -n $mode ]]; then
     line+=", mode=$mode"
-  elif [[ $version == 4 && $obfs == http ]]; then
-    line+=", obfs=http"
+  elif [[ ($version == 4 || $version == 5) && -n $obfs && $obfs != off ]]; then
+    line+=", obfs=$obfs"
     [[ -n $obfs_host ]] && line+=", obfs-host=$obfs_host"
   fi
   line+=", tfo=$client_tfo"
@@ -260,7 +309,7 @@ print_surge_configs() {
   obfs_host=$(config_value "${INST_CONF[$i]}" obfs-host)
   printf '\nSurge 客户端配置：\n'
   if [[ ${INST_MAJOR[$i]} == 5 ]]; then
-    printf '# v5 原生\n%s\n' "$(build_surge_line "$name-v5" "$endpoint" "${INST_PORT[$i]}" "$psk" 5 "" "" "" "$client_tfo" "$client_ecn" true)"
+    printf '# v5 原生\n%s\n' "$(build_surge_line "$name-v5" "$endpoint" "${INST_PORT[$i]}" "$psk" 5 "" "$obfs" "$obfs_host" "$client_tfo" "$client_ecn" true)"
     printf '\n# v4 兼容（连接复用）\n%s\n' "$(build_surge_line "$name-v4" "$endpoint" "${INST_PORT[$i]}" "$psk" 4 "" "$obfs" "$obfs_host" "$client_tfo" "$client_ecn" true)"
   else
     printf '%s\n' "$(build_surge_line "$name" "$endpoint" "${INST_PORT[$i]}" "$psk" 6 "${mode:-default}" "" "" "$client_tfo" "$client_ecn" true)"
@@ -280,41 +329,93 @@ print_default_surge_configs() {
   printf '\n默认沿用 xOS 偏好：客户端 TFO=%s、ECN=true；可从实例菜单重新生成。\n' "$server_tfo"
 }
 
-client_config_menu() {
-  local i=$1 psk endpoint detected name answer client_tfo client_ecn server_tfo
+summary_surge_line() {
+  local i=$1 endpoint=$2 name=$3 psk tfo mode obfs obfs_host line
   psk=$(config_value "${INST_CONF[$i]}" psk)
-  [[ -n $psk && -n ${INST_PORT[$i]} ]] || die "配置缺少 PSK 或有效端口。"
-  detected=$(public_ipv4)
-  if [[ -n $detected ]]; then
-    read -r -p "服务器地址（默认 $detected，可输入域名或 IPv6）: " endpoint
-    [[ -n $endpoint ]] || endpoint=$detected
-  else
-    read -r -p "服务器地址（IPv4、IPv6 或域名）: " endpoint
-    [[ -n $endpoint ]] || die "服务器地址不能为空。"
+  [[ -n $endpoint && -n ${INST_PORT[$i]} && -n $psk ]] || return 1
+  tfo=$(config_value "${INST_CONF[$i]}" tfo)
+  mode=$(config_value "${INST_CONF[$i]}" mode)
+  obfs=$(config_value "${INST_CONF[$i]}" obfs)
+  obfs_host=$(config_value "${INST_CONF[$i]}" obfs-host)
+  line="$name = snell, $(surge_endpoint "$endpoint"), ${INST_PORT[$i]}, psk=$psk, version=${INST_MAJOR[$i]}"
+  [[ ${INST_MAJOR[$i]} != 6 ]] || line+=", mode=${mode:-default}"
+  if [[ ${INST_MAJOR[$i]} == 5 && -n $obfs && $obfs != off ]]; then
+    line+=", obfs=$obfs"
+    [[ -n $obfs_host ]] && line+=", obfs-host=$obfs_host"
   fi
-  read -r -p "节点名称前缀（默认 $(hostname)）: " name
-  [[ -n $name ]] || name="$(hostname)"
-  [[ $name != *,* ]] || die "节点名称不能包含逗号。"
+  line+=", reuse=true"
+  if [[ $tfo == true || $tfo == false ]]; then
+    line+=", tfo=$tfo, ecn=true"
+  fi
+  printf '%s' "$line"
+}
 
-  server_tfo=$(config_value "${INST_CONF[$i]}" tfo)
-  [[ $server_tfo == true || $server_tfo == false ]] || server_tfo=true
-  read -r -p "客户端启用 TCP Fast Open？（默认沿用服务端：$server_tfo）[y/n]: " answer
-  client_tfo=$(yes_no_value "$answer" "$server_tfo")
-  read -r -p "客户端启用 ECN？不兼容网络可能连接失败 [Y/n]: " answer
-  client_ecn=$(yes_no_value "$answer" true)
-  print_surge_configs "$i" "$endpoint" "$name" "$client_tfo" "$client_ecn"
-  printf '\n说明：服务端 tfo 与以上客户端 tfo 是两个独立开关；reuse/ecn 按 xOS 输出偏好生成。\n'
+view_current_configs() {
+  discover_instances
+  local endpoint name base i count=${#INST_UNIT[@]}
+  ((count)) || { warn "未发现 Snell v5/v6 实例。"; pause_main_menu; return; }
+  endpoint=$(public_ipv4)
+  [[ -n $endpoint ]] || { warn "无法获取公网 IPv4，暂时不能生成 Surge 配置。"; pause_main_menu; return; }
+  base=$(hostname)
+  printf '\n%b%s%b\n当前 Surge 配置：\n\n' "$GREEN" "$CONFIG_RULE" "$RESET"
+  for i in "${!INST_UNIT[@]}"; do
+    name="$base v${INST_MAJOR[$i]}"
+    summary_surge_line "$i" "$endpoint" "$name" || warn "${INST_UNIT[$i]} 缺少端口或 PSK，无法生成。"
+    printf '\n'
+  done
+  printf '\n'
+  pause_main_menu
+}
+
+print_instance_config() {
+  local i=$1 ipv4_addr ipv6_addr psk obfs obfs_host ipv6 tfo dns egress dns_pref mode endpoint line
+  ipv4_addr=$(public_ipv4)
+  ipv6_addr=$(public_ipv6)
+  psk=$(config_value "${INST_CONF[$i]}" psk)
+  obfs=$(config_value "${INST_CONF[$i]}" obfs)
+  obfs_host=$(config_value "${INST_CONF[$i]}" obfs-host)
+  ipv6=$(config_value "${INST_CONF[$i]}" ipv6)
+  tfo=$(config_value "${INST_CONF[$i]}" tfo)
+  dns=$(config_value "${INST_CONF[$i]}" dns)
+  egress=$(config_value "${INST_CONF[$i]}" egress-interface)
+  dns_pref=$(config_value "${INST_CONF[$i]}" dns-ip-preference)
+  mode=$(config_value "${INST_CONF[$i]}" mode)
+
+  printf '\n%bSnell Server 配置信息：%b\n%b%s%b\n' "$GREEN" "$RESET" "$GREEN" "$CONFIG_RULE" "$RESET"
+  [[ -z $ipv4_addr ]] || printf ' IPv4 地址\t: %b%s%b\n' "$GREEN" "$ipv4_addr" "$RESET"
+  [[ -z $ipv6_addr ]] || printf ' IPv6 地址\t: %b%s%b\n' "$GREEN" "$ipv6_addr" "$RESET"
+  printf ' 端口\t\t: %b%s%b\n' "$GREEN" "${INST_PORT[$i]}" "$RESET"
+  printf ' 密钥\t\t: %b%s%b\n' "$GREEN" "$psk" "$RESET"
+  if [[ ${INST_MAJOR[$i]} == 5 ]]; then
+    printf ' OBFS\t\t: %b%s%b\n' "$GREEN" "${obfs:-off}" "$RESET"
+    [[ $obfs == off || -z $obfs_host ]] || printf ' OBFS Host\t: %b%s%b\n' "$GREEN" "$obfs_host" "$RESET"
+    printf ' IPv6\t\t: %b%s%b\n' "$GREEN" "${ipv6:-false}" "$RESET"
+  fi
+  [[ -z $tfo ]] || printf ' TFO\t\t: %b%s%b\n' "$GREEN" "$tfo" "$RESET"
+  [[ -z $dns ]] || printf ' DNS\t\t: %b%s%b\n' "$GREEN" "$dns" "$RESET"
+  [[ -z $egress ]] || printf ' 出口网卡\t: %b%s%b\n' "$GREEN" "$egress" "$RESET"
+  if [[ ${INST_MAJOR[$i]} == 6 ]]; then
+    printf ' DNS IP 偏好\t: %b%s%b\n' "$GREEN" "${dns_pref:-default}" "$RESET"
+    printf ' mode\t\t: %b%s%b\n' "$GREEN" "${mode:-default}" "$RESET"
+  fi
+  printf ' 版本\t\t: %b%s%b\n' "$GREEN" "${INST_MAJOR[$i]}" "$RESET"
+  printf '%b%s%b\n' "$GREEN" "$CONFIG_RULE" "$RESET"
+  printf '%b[信息]%b Surge 配置：\n' "$GREEN" "$RESET"
+  endpoint=$ipv4_addr
+  [[ -n $endpoint ]] || endpoint=$ipv6_addr
+  if [[ -n $endpoint ]]; then
+    line=$(summary_surge_line "$i" "$endpoint" "$(hostname)")
+    printf '%s\n' "$line"
+  else
+    warn "无法获取公网 IP，暂时不能生成 Surge 配置。"
+  fi
+  printf '%b%s%b\n' "$GREEN" "$CONFIG_RULE" "$RESET"
 }
 
 view_instance() {
-  local i=$1
-  printf '\nSnell 实例配置：\n'
-  printf '服务: %s\n二进制: %s\n配置: %s\n状态: %s / %s\n' \
-    "${INST_UNIT[$i]}" "${INST_BIN[$i]}" "${INST_CONF[$i]}" \
-    "${INST_ACTIVE[$i]}" "${INST_ENABLED[$i]}"
-  printf '%s\n' "------------------------------------------------------------"
-  cat "${INST_CONF[$i]}"
-  printf '%s\n' "------------------------------------------------------------"
+  print_instance_config "$1"
+  printf '\n'
+  pause_management_menu
 }
 
 port_free() {
@@ -374,87 +475,144 @@ apply_config_change() {
   warn "新配置启动失败，正在恢复。"
   cp -a "$backup" "$conf"
   "$SYSTEMCTL_BIN" restart "$unit" || true
-  "$SYSTEMCTL_BIN" is-active --quiet "$unit" || die "回滚后服务仍未恢复，请检查 $unit。"
+  "$SYSTEMCTL_BIN" is-active --quiet "$unit" || die "回滚后服务仍未恢复，请检查 ${unit}。"
   die "已回滚本次配置修改。"
 }
 
 edit_instance() {
   local i=$1 choice key value port current display_value psk
   psk=$(config_value "${INST_CONF[$i]}" psk)
-  printf '\n当前配置摘要\n端口: %s\nPSK: [已设置，%s 位]\nTFO: %s\nDNS: %s\n出口接口: %s\n' \
-    "${INST_PORT[$i]:--}" "${#psk}" "$(config_value "${INST_CONF[$i]}" tfo)" \
+  printf '\n当前配置摘要\n%b%s%b\n' "$GREEN" "$CONFIG_RULE" "$RESET"
+  printf '1. 端口: %s\n2. PSK: %s\n3. TFO: %s\n4. DNS: %s\n5. 出口: %s\n' \
+    "${INST_PORT[$i]:--}" "$psk" "$(config_value "${INST_CONF[$i]}" tfo)" \
     "$(config_value "${INST_CONF[$i]}" dns)" "$(config_value "${INST_CONF[$i]}" egress-interface)"
   if [[ ${INST_MAJOR[$i]} == 5 ]]; then
-    printf 'IPv6 目标解析: %s\nOBFS: %s\nOBFS Host: %s\n' \
+    printf '6. IPv6: %s\n7. OBFS: %s\n8. OBFS Host: %s\n' \
       "$(config_value "${INST_CONF[$i]}" ipv6)" "$(config_value "${INST_CONF[$i]}" obfs)" \
       "$(config_value "${INST_CONF[$i]}" obfs-host)"
   else
-    printf 'DNS IP 偏好: %s\nmode: %s\nlisten: %s\n' \
+    printf '6. DNS IP 偏好: %s\n7. mode: %s\n8. listen: %s\n' \
       "$(config_value "${INST_CONF[$i]}" dns-ip-preference)" "$(config_value "${INST_CONF[$i]}" mode)" \
       "${INST_LISTEN[$i]}"
   fi
-  printf '\n1. 端口\n2. PSK\n3. TFO\n4. DNS\n5. 出口接口\n'
-  if [[ ${INST_MAJOR[$i]} == 5 ]]; then
-    printf '6. IPv6 解析\n7. OBFS\n8. OBFS Host\n'
-  else
-    printf '6. DNS IP 偏好\n7. mode\n8. listen（完整值）\n'
-  fi
-  read -r -p "选择配置项: " choice
+  printf '%b%s%b\n' "$GREEN" "$CONFIG_RULE" "$RESET"
+  prompt_read choice "请输入修改项[0-9]:"
   case "$choice" in
     1)
-      read -r -p "新端口: " port
-      current=${INST_PORT[$i]}
-      port_free "$port" "$current" || die "端口无效或已被占用。"
+      while true; do
+        prompt_read port "新端口: "
+        [[ $port != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+        current=${INST_PORT[$i]}
+        if port_free "$port" "$current"; then break; fi
+        warn "端口无效或已被占用，请重新输入。"
+      done
       key=listen; value=$(replace_listen_port "${INST_LISTEN[$i]}" "$port")
       ;;
     2)
-      key=psk; read -r -p "新 PSK（留空按 xOS 默认随机生成）: " value; [[ -n $value ]] || value=$(random_psk "${INST_MAJOR[$i]}")
-      if [[ ${INST_MAJOR[$i]} == 6 ]]; then
-        [[ ${#value} -ge 16 && ${#value} -le 255 ]] || die "v6 PSK 必须为 16–255 位。"
-      else
-        [[ ${#value} -ge 12 && ${#value} -le 255 ]] || die "v5 PSK 必须为 12–255 位。"
-      fi
+      key=psk
+      while true; do
+        prompt_read value "新 PSK（留空按 xOS 默认随机生成）: "
+        [[ $value != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+        [[ -n $value ]] || value=$(random_psk "${INST_MAJOR[$i]}")
+        [[ ${#value} -ge 16 && ${#value} -le 255 ]] && break
+        warn "PSK 必须为 16–255 位，请重新输入。"
+      done
       ;;
-    3) key=tfo; read -r -p "true/false: " value; [[ $value == true || $value == false ]] || die "只能输入 true 或 false。" ;;
-    4) key=dns; read -r -p "DNS（逗号分隔）: " value; [[ -n $value ]] || die "DNS 不能为空。" ;;
-    5) key=egress-interface; read -r -p "出口接口: " value; [[ -n $value ]] || die "出口接口不能为空。" ;;
+    3)
+      key=tfo
+      while true; do
+        prompt_read value "true/false: "
+        [[ $value != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+        [[ $value == true || $value == false ]] && break
+        warn "只能输入 true 或 false。"
+      done
+      ;;
+    4)
+      key=dns
+      while true; do
+        prompt_read value "DNS（逗号分隔）: "
+        [[ $value != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+        dns_value_valid "$value" && break
+        warn "DNS 格式无效，请重新输入。"
+      done
+      ;;
+    5)
+      key=egress-interface
+      while true; do
+        prompt_read value "出口接口: "
+        [[ $value != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+        [[ -n $value ]] && break
+        warn "出口接口不能为空。"
+      done
+      ;;
     6)
       if [[ ${INST_MAJOR[$i]} == 5 ]]; then
-        key=ipv6; read -r -p "true/false: " value; [[ $value == true || $value == false ]] || die "只能输入 true 或 false。"
+        key=ipv6
+        while true; do
+          prompt_read value "true/false: "
+          [[ $value != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+          [[ $value == true || $value == false ]] && break
+          warn "只能输入 true 或 false。"
+        done
       else
-        key=dns-ip-preference; read -r -p "default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only: " value
-        [[ $value =~ ^(default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only)$ ]] || die "无效值。"
+        key=dns-ip-preference
+        while true; do
+          prompt_read value "default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only: "
+          [[ $value != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+          [[ $value =~ ^(default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only)$ ]] && break
+          warn "无效值，请重新输入。"
+        done
       fi
       ;;
     7)
       if [[ ${INST_MAJOR[$i]} == 5 ]]; then
-        key=obfs; read -r -p "off/http: " value; [[ $value == off || $value == http ]] || die "无效值。"
+        key=obfs
+        while true; do
+          prompt_read value "off/http/tls: "
+          [[ $value != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+          [[ $value =~ ^(off|http|tls)$ ]] && break
+          warn "无效值，请重新输入。"
+        done
       else
-        key=mode; read -r -p "default/unshaped/unsafe-raw: " value
-        [[ $value =~ ^(default|unshaped|unsafe-raw)$ ]] || die "无效值。"
-        [[ $value != unsafe-raw ]] || { read -r -p "unsafe-raw 为明文，仅输入 UNSAFE 确认: " choice; [[ $choice == UNSAFE ]] || die "已取消。"; }
+        key=mode
+        while true; do
+          prompt_read value "default/unshaped/unsafe-raw: "
+          [[ $value != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+          [[ $value =~ ^(default|unshaped|unsafe-raw)$ ]] || { warn "无效值，请重新输入。"; continue; }
+          if [[ $value == unsafe-raw ]]; then
+            prompt_read choice "unsafe-raw 为明文，仅输入 UNSAFE 确认: "
+            [[ $choice == UNSAFE ]] || { warn "未确认 unsafe-raw，请重新选择。"; continue; }
+          fi
+          break
+        done
       fi
       ;;
     8)
       if [[ ${INST_MAJOR[$i]} == 5 ]]; then key=obfs-host; else key=listen; fi
-      read -r -p "新值: " value; [[ -n $value ]] || die "值不能为空。"
+      prompt_read value "新值: "
+      [[ $value != 00 ]] || { info "已取消修改。"; pause_management_menu; return; }
+      [[ -n $value ]] || { warn "值不能为空。"; pause_management_menu; return; }
       if [[ $key == listen ]]; then
         port=$(extract_port "$value")
-        [[ -n $port ]] || die "listen 必须包含端口。"
+        [[ -n $port ]] || { warn "listen 必须包含端口。"; pause_management_menu; return; }
         while IFS= read -r current; do
-          [[ $(extract_port "$current") == "$port" ]] || die "v1.0 要求多个监听地址使用同一端口。"
+          [[ $(extract_port "$current") == "$port" ]] || { warn "v1.0 要求多个监听地址使用同一端口。"; pause_management_menu; return; }
         done < <(tr ',' '\n' <<< "$value")
-        port_free "$port" "${INST_PORT[$i]}" || die "listen 端口已被占用。"
+        port_free "$port" "${INST_PORT[$i]}" || { warn "listen 端口已被占用。"; pause_management_menu; return; }
       fi
       ;;
-    *) die "无效选项。" ;;
+    0|00|"")
+      pause_management_menu
+      return 0
+      ;;
+    *) warn "无效选项。"; pause_management_menu; return ;;
   esac
   display_value=$value
-  [[ $key != psk ]] || display_value="[已设置，${#value} 位]"
   printf '将修改 %s: %s = %s\n' "${INST_UNIT[$i]}" "$key" "$display_value"
-  read -r -p "确认并重启该实例？[y/N]: " choice
-  [[ $choice =~ ^[Yy]$ ]] || { info "已取消。"; return; }
+  prompt_read choice "确认并重启该实例？[y/N]: "
+  [[ $choice =~ ^[Yy]$ ]] || { info "已取消。"; pause_management_menu; return; }
   apply_config_change "$i" "$key" "$value"
+  pause_management_menu
 }
 
 download_official() {
@@ -485,16 +643,22 @@ download_official() {
 firewall_offer() {
   local major=$1 port=$2 answer
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    read -r -p "UFW 已启用，放行 $port/tcp$([[ $major == 5 ]] && printf ' 和 udp')？[Y/n]: " answer
-    [[ -n $answer ]] || answer=y
-    if [[ $answer =~ ^[Yy]$ ]]; then ufw allow "$port/tcp"; [[ $major == 5 ]] && ufw allow "$port/udp"; fi
+    prompt_read answer "UFW 已启用，是否放行 $port/tcp$([[ $major == 5 ]] && printf " 和 $port/udp")？[y/N]: "
+    if [[ $answer =~ ^[Yy]$ ]]; then
+      ufw allow "$port/tcp"; [[ $major == 5 ]] && ufw allow "$port/udp"
+      info "UFW 端口规则已添加。"
+    else
+      info "未修改 UFW 规则。"
+    fi
   elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
-    read -r -p "firewalld 已启用，放行新端口？[Y/n]: " answer
-    [[ -n $answer ]] || answer=y
+    prompt_read answer "firewalld 已启用，是否放行新端口？[y/N]: "
     if [[ $answer =~ ^[Yy]$ ]]; then
       firewall-cmd --permanent --add-port="$port/tcp"
       [[ $major == 5 ]] && firewall-cmd --permanent --add-port="$port/udp"
       firewall-cmd --reload
+      info "firewalld 端口规则已添加。"
+    else
+      info "未修改 firewalld 规则。"
     fi
   else
     info "未检测到启用的 UFW/firewalld；未修改防火墙。"
@@ -508,7 +672,7 @@ write_server_config() {
   if [[ $major == 5 ]]; then
     printf '%s\n' '[snell-server]' "listen = 0.0.0.0:$port" "psk = $psk" \
       "ipv6 = $ipv6" "obfs = $obfs" > "$dest"
-    [[ $obfs != http ]] || printf 'obfs-host = %s\n' "$obfs_host" >> "$dest"
+    [[ $obfs == off ]] || printf 'obfs-host = %s\n' "$obfs_host" >> "$dest"
     printf '%s\n' "tfo = $server_tfo" "dns = $dns" 'version = 5' >> "$dest"
   else
     printf '%s\n' '[snell-server]' "listen = 0.0.0.0:$port,[::]:$port" "psk = $psk" \
@@ -517,66 +681,250 @@ write_server_config() {
   fi
 }
 
+dns_value_valid() {
+  local value=$1 item
+  [[ -n $(trim "$value") ]] || return 1
+  IFS=',' read -r -a dns_items <<< "$value"
+  ((${#dns_items[@]})) || return 1
+  for item in "${dns_items[@]}"; do
+    [[ -n $(trim "$item") ]] || return 1
+  done
+}
+
+install_set_port() {
+  local input
+  while true; do
+    warn "本步骤不修改系统防火墙；部署完成后将单独询问是否放行端口！"
+    printf '请输入 Snell Server 端口%b[1-65535]%b\n' "$YELLOW" "$RESET"
+    prompt_read input "(${GREEN}默认${RESET}: 2345):"
+    [[ $input != 00 ]] || return 2
+    [[ -n $input ]] || input=2345
+    if [[ ! $input =~ ^[0-9]+$ || $input -lt 1 || $input -gt 65535 ]]; then
+      warn "输入错误，请输入 1-65535 之间的端口号。"
+      continue
+    fi
+    if ! port_free "$input"; then
+      warn "端口 $input 已被占用，请选择其他端口。"
+      continue
+    fi
+    INSTALL_PORT=$input
+    print_install_result "端口 :" "$INSTALL_PORT"
+    return 0
+  done
+}
+
+install_set_psk() {
+  local major=$1 input
+  while true; do
+    printf '请输入 Snell Server 密钥 [0-9][a-z][A-Z]\n'
+    [[ $major != 6 ]] || warn "当前目标协议为 Snell v6，密钥长度要求在 16-255 位之间"
+    prompt_read input "(${GREEN}默认${RESET}: 随机生成):"
+    [[ $input != 00 ]] || return 2
+    if [[ -z $input ]]; then
+      input=$(random_psk "$major") || die "未能生成随机 PSK。"
+    fi
+    if [[ ${#input} -lt 16 || ${#input} -gt 255 ]]; then
+      warn "Snell v$major 密钥长度必须在 16 到 255 位之间，请重新输入！"
+      continue
+    fi
+    INSTALL_PSK=$input
+    print_install_result "密钥 :" "$INSTALL_PSK"
+    return 0
+  done
+}
+
+install_set_obfs() {
+  local input host_input
+  while true; do
+    printf '配置 OBFS，%b[提示]%b 无特殊作用不建议启用该项。\n%s\n' "$YELLOW" "$RESET" "$INSTALL_RULE"
+    printf '%b 1.%b TLS  %b 2.%b HTTP  %b 3.%b 关闭\n%s\n' \
+      "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET" "$INSTALL_RULE"
+    prompt_read input "(${GREEN}默认${RESET}：3.关闭)："
+    [[ $input != 00 ]] || return 2
+    [[ -n $input ]] || input=3
+    case $input in
+      1) INSTALL_OBFS=tls ;;
+      2) INSTALL_OBFS=http ;;
+      3) INSTALL_OBFS=off; INSTALL_OBFS_HOST="" ;;
+      *) warn "请输入正确数字[1-3]。"; continue ;;
+    esac
+    if [[ $INSTALL_OBFS != off ]]; then
+      printf '请输入 Snell Server 域名\n'
+      prompt_read host_input "(${GREEN}默认${RESET}: www.wechat.com):"
+      [[ $host_input != 00 ]] || return 2
+      INSTALL_OBFS_HOST=${host_input:-www.wechat.com}
+    fi
+    print_install_result "OBFS 状态：" "$INSTALL_OBFS"
+    [[ $INSTALL_OBFS == off ]] || print_install_result "OBFS 域名：" "$INSTALL_OBFS_HOST"
+    return 0
+  done
+}
+
+install_set_ipv6() {
+  local input
+  while true; do
+    printf '是否开启 IPv6 解析？\n%s\n' "$INSTALL_RULE"
+    printf '%b 1.%b 开启  %b 2.%b 关闭\n%s\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$INSTALL_RULE"
+    prompt_read input "(${GREEN}默认${RESET}：2.关闭)："
+    [[ $input != 00 ]] || return 2
+    [[ -n $input ]] || input=2
+    case $input in
+      1) INSTALL_IPV6=true ;;
+      2) INSTALL_IPV6=false ;;
+      *) warn "请输入正确数字[1-2]。"; continue ;;
+    esac
+    print_install_result "IPv6 解析 开启状态：" "$INSTALL_IPV6"
+    return 0
+  done
+}
+
+install_set_tfo() {
+  local input
+  while true; do
+    printf '是否开启 TCP Fast Open？\n%s\n' "$INSTALL_RULE"
+    printf '%b 1.%b 开启  %b 2.%b 关闭\n%s\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$INSTALL_RULE"
+    prompt_read input "(${GREEN}默认${RESET}：1.开启)："
+    [[ $input != 00 ]] || return 2
+    [[ -n $input ]] || input=1
+    case $input in
+      1) INSTALL_TFO=true ;;
+      2) INSTALL_TFO=false ;;
+      *) warn "请输入正确数字[1-2]。"; continue ;;
+    esac
+    print_install_result "TCP Fast Open 开启状态：" "$INSTALL_TFO"
+    return 0
+  done
+}
+
+install_set_dns() {
+  local input default_dns='1.1.1.1, 8.8.8.8, 2001:4860:4860::8888'
+  while true; do
+    warn "请输入正确格式的 DNS，多条记录以英文逗号隔开。"
+    prompt_read input "(${GREEN}默认值${RESET}：${default_dns})："
+    [[ $input != 00 ]] || return 2
+    [[ -n $input ]] || input=$default_dns
+    if ! dns_value_valid "$input"; then
+      warn "DNS 不能为空，且英文逗号之间必须包含有效值。"
+      continue
+    fi
+    INSTALL_DNS=$input
+    print_install_result "当前 DNS 为：" "$INSTALL_DNS"
+    return 0
+  done
+}
+
+install_set_dns_preference() {
+  local input
+  while true; do
+    printf '配置 DNS IP 偏好 (Snell v6 专属)\n%s\n' "$INSTALL_RULE"
+    printf '%b 1.%b default  %b 2.%b prefer-ipv4  %b 3.%b prefer-ipv6  %b 4.%b ipv4-only  %b 5.%b ipv6-only\n%s\n' \
+      "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET" "$INSTALL_RULE"
+    prompt_read input "(${GREEN}默认${RESET}：1.default)："
+    [[ $input != 00 ]] || return 2
+    [[ -n $input ]] || input=1
+    case $input in
+      1) INSTALL_DNS_PREF=default ;;
+      2) INSTALL_DNS_PREF=prefer-ipv4 ;;
+      3) INSTALL_DNS_PREF=prefer-ipv6 ;;
+      4) INSTALL_DNS_PREF=ipv4-only ;;
+      5) INSTALL_DNS_PREF=ipv6-only ;;
+      *) warn "请输入正确数字[1-5]。"; continue ;;
+    esac
+    print_install_result "DNS IP 偏好 状态：" "$INSTALL_DNS_PREF"
+    return 0
+  done
+}
+
+install_set_mode() {
+  local input confirm
+  while true; do
+    printf '配置 混淆模式\n%s\n' "$INSTALL_RULE"
+    printf '%b 1.%b default  %b 2.%b unshaped  %b 3.%b unsafe-raw\n%s\n' \
+      "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET" "$INSTALL_RULE"
+    prompt_read input "(${GREEN}默认${RESET}：1.default)："
+    [[ $input != 00 ]] || return 2
+    [[ -n $input ]] || input=1
+    case $input in
+      1) INSTALL_MODE=default ;;
+      2) INSTALL_MODE=unshaped ;;
+      3)
+        warn "unsafe-raw 不加密传输内容。"
+        prompt_read confirm "如需继续，请输入 UNSAFE："
+        [[ $confirm != 00 ]] || return 2
+        if [[ $confirm != UNSAFE ]]; then
+          warn "未确认 unsafe-raw，请重新选择 mode。"
+          continue
+        fi
+        INSTALL_MODE=unsafe-raw
+        ;;
+      *) warn "请输入正确数字[1-3]。"; continue ;;
+    esac
+    print_install_result "混淆模式：" "$INSTALL_MODE"
+    return 0
+  done
+}
+
+install_step_or_cancel() {
+  local rc=0
+  "$@" || rc=$?
+  if [[ $rc -eq 2 ]]; then
+    cancel_install
+    return 2
+  fi
+  return "$rc"
+}
+
 deploy_major() {
   local major=$1
   local unit="snell-v${major}.service" etcdir="$MANAGED_ETC/v${major}"
   local libdir="$MANAGED_LIB/v${major}"
   local conf="$etcdir/config.conf" bin="$libdir/snell-server"
   local unitfile="$SYSTEMD_DIR/$unit" port psk choice stage committed=0
-  local server_tfo=true dns='1.1.1.1, 8.8.8.8, 2001:4860:4860::8888'
-  local ipv6=false obfs=off obfs_host="" dns_ip_pref=default mode=default
+  local server_tfo dns ipv6 obfs obfs_host dns_ip_pref mode
   local i
   for i in "${!INST_MAJOR[@]}"; do [[ ${INST_MAJOR[$i]} != "$major" ]] || die "已存在 v$major 实例：${INST_UNIT[$i]}"; done
   [[ ! -e $unitfile && ! -e $etcdir && ! -e $libdir ]] || die "目标路径已存在，拒绝覆盖：v$major"
-  port=2345
-  if ! port_free "$port"; then
-    port=$(random_port) || die "默认端口 2345 已占用，且未能找到其他空闲端口。"
-    warn "xOS 默认端口 2345 已占用，本次改用空闲端口 $port。"
-  fi
-  read -r -p "监听端口（默认 $port）: " choice; [[ -z $choice ]] || port=$choice
-  port_free "$port" || die "端口无效或已被占用。"
-  psk=$(random_psk "$major") || die "未能生成随机 PSK。"
-  read -r -p "PSK（留空按 xOS 默认生成：v5 16位 / v6 20位）: " choice; [[ -z $choice ]] || psk=$choice
-  [[ ${#psk} -ge 16 && ${#psk} -le 255 ]] || die "PSK 必须为 16–255 位。"
-
-  read -r -p "服务端启用 TCP Fast Open？[Y/n]: " choice
-  [[ ! $choice =~ ^[Nn]$ ]] || server_tfo=false
-  read -r -p "DNS（默认 $dns）: " choice; [[ -z $choice ]] || dns=$choice
-  [[ -n $dns ]] || die "DNS 不能为空。"
+  INSTALL_PORT=""; INSTALL_PSK=""; INSTALL_TFO=true; INSTALL_DNS=""
+  INSTALL_IPV6=false; INSTALL_OBFS=off; INSTALL_OBFS_HOST=""
+  INSTALL_DNS_PREF=default; INSTALL_MODE=default
+  printf '\n%b[提示]%b 安装过程中输入 00 可随时取消并返回管理菜单。\n\n' "$YELLOW" "$RESET"
+  info "开始设置 配置..."
+  install_step_or_cancel install_set_port || return 0
+  install_step_or_cancel install_set_psk "$major" || return 0
   if [[ $major == 5 ]]; then
-    read -r -p "允许解析并连接 IPv6 目标？[y/N]: " choice
-    ipv6=$(yes_no_value "$choice")
-    read -r -p "OBFS（默认 off，可输入 http）: " choice
-    [[ -z $choice ]] || obfs=$choice
-    [[ $obfs == off || $obfs == http ]] || die "OBFS 只能是 off 或 http。"
-    if [[ $obfs == http ]]; then
-      read -r -p "OBFS Host（必填）: " obfs_host
-      [[ -n $obfs_host ]] || die "启用 HTTP OBFS 时 Host 不能为空。"
-    fi
+    install_step_or_cancel install_set_obfs || return 0
+    install_step_or_cancel install_set_ipv6 || return 0
+    install_step_or_cancel install_set_tfo || return 0
+    install_step_or_cancel install_set_dns || return 0
   else
-    read -r -p "DNS IP 偏好（默认 default）: " choice
-    [[ -z $choice ]] || dns_ip_pref=$choice
-    [[ $dns_ip_pref =~ ^(default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only)$ ]] || die "无效 DNS IP 偏好。"
-    read -r -p "v6 mode（默认 default，可选 unshaped/unsafe-raw）: " choice
-    [[ -z $choice ]] || mode=$choice
-    [[ $mode =~ ^(default|unshaped|unsafe-raw)$ ]] || die "无效 mode。"
-    if [[ $mode == unsafe-raw ]]; then
-      read -r -p "unsafe-raw 不加密，输入 UNSAFE 确认: " choice
-      [[ $choice == UNSAFE ]] || die "已取消 unsafe-raw 部署。"
-    fi
+    install_step_or_cancel install_set_tfo || return 0
+    install_step_or_cancel install_set_dns || return 0
+    install_step_or_cancel install_set_dns_preference || return 0
+    install_step_or_cancel install_set_mode || return 0
   fi
+
+  port=$INSTALL_PORT; psk=$INSTALL_PSK; server_tfo=$INSTALL_TFO; dns=$INSTALL_DNS
+  ipv6=${INSTALL_IPV6:-false}; obfs=${INSTALL_OBFS:-off}; obfs_host=${INSTALL_OBFS_HOST:-}
+  dns_ip_pref=${INSTALL_DNS_PREF:-default}; mode=${INSTALL_MODE:-default}
 
   printf '\n部署摘要（不会修改现有实例）\n'
-  printf '版本: v%s\n服务: %s\n监听端口: %s\nPSK: [已设置，%s 位]\n服务端 TFO: %s\nDNS: %s\n' \
-    "$major" "$unit" "$port" "${#psk}" "$server_tfo" "$dns"
+  printf '版本: v%s\n服务: %s\n端口: %s\nPSK: %s\nTFO: %s\nDNS: %s\n' \
+    "$major" "$unit" "$port" "$psk" "$server_tfo" "$dns"
   if [[ $major == 5 ]]; then
-    printf 'IPv6 目标解析: %s\nOBFS: %s\n' "$ipv6" "$obfs"
-    [[ $obfs == http ]] && printf 'OBFS Host: %s\n' "$obfs_host"
+    printf 'IPv6: %s\nOBFS: %s\n' "$ipv6" "$obfs"
+    [[ $obfs == off ]] || printf 'OBFS Host: %s\n' "$obfs_host"
   else
     printf 'DNS IP 偏好: %s\nmode: %s\n' "$dns_ip_pref" "$mode"
   fi
-  read -r -p "确认部署？[y/N]: " choice
-  [[ $choice =~ ^[Yy]$ ]] || { info "已取消。"; return; }
+  while true; do
+    prompt_read choice "确认部署？[y/N]: "
+    case $choice in
+      [Yy]) break ;;
+      ""|[Nn]|00) cancel_install; return 0 ;;
+      *) warn "请输入 y 或 n。" ;;
+    esac
+  done
+  info "开始检查安装条件..."
   stage=$(mktemp -d /tmp/snell-manager.XXXXXX)
   cleanup_deploy() {
     local rc=$?
@@ -592,15 +940,20 @@ deploy_major() {
     return "$rc"
   }
   trap cleanup_deploy RETURN EXIT
+  info "开始下载 Snell v$major..."
   download_official "$major" "$stage"
+  info "下载完成，SHA-256 校验通过。"
+  info "开始安装 Snell Server..."
   install -d -m 0700 "$etcdir"
   install -d -m 0755 "$libdir"
   install -m 0755 "$stage/snell-server" "$bin"
+  info "开始写入配置文件..."
   umask 077
   write_server_config "$conf" "$major" "$port" "$psk" "$server_tfo" "$dns" \
     "$ipv6" "$obfs" "$obfs_host" "$dns_ip_pref" "$mode"
   chmod 600 "$conf"
   umask 022
+  info "开始安装服务脚本..."
   printf '%s\n' '[Unit]' "Description=Snell v$major managed instance" \
     'After=network-online.target' 'Wants=network-online.target' '' '[Service]' \
     'Type=simple' 'User=root' 'LimitNOFILE=32768' \
@@ -608,22 +961,25 @@ deploy_major() {
     'WantedBy=multi-user.target' > "$unitfile"
   chmod 644 "$unitfile"
   "$SYSTEMCTL_BIN" daemon-reload
+  info "开始启动 Snell Server..."
   "$SYSTEMCTL_BIN" enable --now "$unit"
   sleep 1
   "$SYSTEMCTL_BIN" is-active --quiet "$unit" || { "$SYSTEMCTL_BIN" status "$unit" --no-pager || true; return 1; }
   "$SS_BIN" -H -lnt 2>/dev/null | grep -q ":$port " || die "未发现 $port/TCP 监听。"
   if [[ $major == 5 ]]; then "$SS_BIN" -H -lnu 2>/dev/null | grep -q ":$port " || die "未发现 $port/UDP 监听。"; fi
   committed=1
-  firewall_offer "$major" "$port"
-  info "v$major 已部署并设为开机启动。"
-  printf 'PSK: %s\n' "$psk"
+  info "Snell Server 启动成功！"
+  info "启动完成，查看配置..."
   discover_instances
   for i in "${!INST_UNIT[@]}"; do
     if [[ ${INST_UNIT[$i]} == "$unit" ]]; then
-      print_default_surge_configs "$i"
+      print_instance_config "$i"
       break
     fi
   done
+  firewall_offer "$major" "$port"
+  info "v$major 已部署并设为开机启动。"
+  pause_management_menu
 }
 
 update_instance() {
@@ -631,9 +987,13 @@ update_instance() {
   local stage backup choice expected_version current
   current=${INST_VERSION[$i]}
   expected_version=$([[ $major == 5 ]] && printf '%s' "$V5_VERSION" || printf '%s' "$V6_PACKAGE_VERSION")
-  printf '当前 v%s；目标官方包 %s。将只更新 %s。\n' "$current" "$expected_version" "$unit"
-  read -r -p "继续？[y/N]: " choice
-  [[ $choice =~ ^[Yy]$ ]] || return 0
+  printf '当前 v%s；目标官方包 %s。\n' "$current" "$expected_version"
+  prompt_read choice "确认更新 [y/N]: "
+  if [[ ! $choice =~ ^[Yy]$ ]]; then
+    info "已取消更新。"
+    pause_management_menu
+    return 0
+  fi
   stage=$(mktemp -d /tmp/snell-manager-update.XXXXXX)
   download_official "$major" "$stage"
   backup="${bin}.backup-$(date +%Y%m%d-%H%M%S)"
@@ -647,78 +1007,147 @@ update_instance() {
     "$SYSTEMCTL_BIN" restart "$unit" || true
     die "更新已回滚。"
   fi
+  pause_management_menu
 }
 
 remove_managed_instance() {
   local i=$1 confirm unit conf bin
-  [[ ${INST_MANAGED[$i]} == yes ]] || die "旧实例只原地管理，不允许脚本删除。"
+  [[ ${INST_MANAGED[$i]} == yes ]] || { warn "旧实例只原地管理，不允许脚本删除。"; pause_management_menu; return 1; }
   unit=${INST_UNIT[$i]}; conf=${INST_CONF[$i]}; bin=${INST_BIN[$i]}
-  read -r -p "输入服务名 $unit 确认卸载: " confirm
-  [[ $confirm == "$unit" ]] || die "确认不匹配，已取消。"
+  prompt_read confirm "输入服务名 $unit 确认卸载: "
+  [[ $confirm == "$unit" ]] || { warn "确认不匹配，已取消。"; pause_management_menu; return 1; }
   "$SYSTEMCTL_BIN" disable --now "$unit"
   rm -f "$SYSTEMD_DIR/$unit" "$conf" "$bin"
   rmdir "${conf%/*}" "${bin%/*}" 2>/dev/null || true
   "$SYSTEMCTL_BIN" daemon-reload
-  info "已删除脚本托管实例 $unit；该操作不恢复防火墙规则。"
+  info "已删除脚本托管实例 ${unit}；该操作不恢复防火墙规则。"
   discover_instances
+  pause_management_menu
 }
 
-select_instance() {
-  local selection
-  ((${#INST_UNIT[@]})) || return 1
-  read -r -p "实例编号: " selection
-  [[ $selection =~ ^[0-9]+$ && $selection -ge 1 && $selection -le ${#INST_UNIT[@]} ]] || die "无效编号。"
-  SELECTED_INDEX=$((selection-1))
+find_major_instance() {
+  local major=$1 i
+  MAJOR_INDEX=""
+  for i in "${!INST_MAJOR[@]}"; do
+    if [[ ${INST_MAJOR[$i]} == "$major" ]]; then
+      MAJOR_INDEX=$i
+      return 0
+    fi
+  done
+  return 1
 }
 
-instance_menu() {
-  local i=$1 choice
+print_major_status() {
+  local major=$1 i=""
+  find_major_instance "$major" && i=$MAJOR_INDEX
+  if [[ -z $i ]]; then
+    printf '%b未安装%b' "$RED" "$RESET"
+  elif [[ ${INST_ACTIVE[$i]} == active ]]; then
+    printf '%b已安装%b%b[v%s]%b且%b已启动%b' \
+      "$GREEN" "$RESET" "$YELLOW" "$major" "$RESET" "$GREEN" "$RESET"
+  else
+    printf '%b已安装%b%b[v%s]%b但%b未启动%b' \
+      "$GREEN" "$RESET" "$YELLOW" "$major" "$RESET" "$RED" "$RESET"
+  fi
+}
+
+print_main_status() {
+  printf 'v5: '
+  print_major_status 5
+  printf '\nv6: '
+  print_major_status 6
+}
+
+view_instance_status() {
+  local i=$1
+  "$SYSTEMCTL_BIN" status "${INST_UNIT[$i]}" --no-pager || true
+  pause_management_menu
+}
+
+major_menu() {
+  local major=$1 choice i
   while true; do
-    printf '\n[%s / v%s / %s]\n' "${INST_UNIT[$i]}" "${INST_VERSION[$i]}" "${INST_ACTIVE[$i]}"
-    printf '1. 查看服务端配置\n2. 生成 Surge 客户端配置\n3. 启动\n4. 停止\n5. 重启\n6. 查看状态\n7. 查看日志\n8. 修改配置\n9. 同版本更新\n10. 卸载脚本托管实例\n0. 返回\n'
-    read -r -p "选择: " choice
+    discover_instances
+    i=""
+    find_major_instance "$major" && i=$MAJOR_INDEX
+    printf '\n%s\nSnell v%s 管理\n%s\n' "$MENU_RULE" "$major" "$MENU_RULE"
+    printf '1.安装 Snell v%s\n2.卸载 Snell v%s\n3.更新 当前配置\n' "$major" "$major"
+    printf '%s\n' "$MENU_DIVIDER"
+    printf '4.启动 Snell v%s\n5.停止 Snell v%s\n6.重启 Snell v%s\n' "$major" "$major" "$major"
+    printf '%s\n' "$MENU_DIVIDER"
+    printf '7.设置 配置信息\n8.查看 配置信息\n9.查看 运行状态\n'
+    printf '%s\n 00. 返回\n%s\n\n' "$MENU_DIVIDER" "$MENU_RULE"
+    printf '当前状态: '
+    print_major_status "$major"
+    printf '\n\n'
+    read -r -p "请输入数字[0-9]:" choice
     case "$choice" in
-      1) view_instance "$i" ;;
-      2) client_config_menu "$i" ;;
-      3) "$SYSTEMCTL_BIN" start "${INST_UNIT[$i]}" ;;
-      4) "$SYSTEMCTL_BIN" stop "${INST_UNIT[$i]}" ;;
-      5) "$SYSTEMCTL_BIN" restart "${INST_UNIT[$i]}" ;;
-      6) "$SYSTEMCTL_BIN" status "${INST_UNIT[$i]}" --no-pager || true ;;
-      7) journalctl -u "${INST_UNIT[$i]}" -n 50 --no-pager | sed -E 's/(psk[=: ]+)[^ ,]+/\1[REDACTED]/Ig' ;;
-      8) edit_instance "$i"; discover_instances; return ;;
-      9) update_instance "$i"; discover_instances; return ;;
-      10) remove_managed_instance "$i"; return ;;
-      0) return ;;
+      1)
+        if [[ -n $i ]]; then
+          warn "Snell v$major 已安装：${INST_UNIT[$i]}"; pause_management_menu
+        elif ! (deploy_major "$major"); then
+          warn "Snell v$major 安装操作未完成，已停止当前操作。"; pause_management_menu
+        fi
+        ;;
+      2)
+        if [[ -n $i ]]; then remove_managed_instance "$i" || true; else warn "Snell v$major 尚未安装。"; pause_management_menu; fi
+        ;;
+      3)
+        if [[ -n $i ]]; then
+          if ! (update_instance "$i"); then warn "Snell v$major 更新操作未完成。"; pause_management_menu; fi
+        else warn "Snell v$major 尚未安装。"; pause_management_menu; fi
+        ;;
+      4)
+        if [[ -n $i ]]; then
+          if "$SYSTEMCTL_BIN" start "${INST_UNIT[$i]}"; then info "Snell v$major 已启动。"; else warn "Snell v$major 启动失败。"; fi
+        else warn "Snell v$major 尚未安装。"; fi
+        pause_management_menu
+        ;;
+      5)
+        if [[ -n $i ]]; then
+          if "$SYSTEMCTL_BIN" stop "${INST_UNIT[$i]}"; then info "Snell v$major 已停止。"; else warn "Snell v$major 停止失败。"; fi
+        else warn "Snell v$major 尚未安装。"; fi
+        pause_management_menu
+        ;;
+      6)
+        if [[ -n $i ]]; then
+          if "$SYSTEMCTL_BIN" restart "${INST_UNIT[$i]}"; then info "Snell v$major 已重启。"; else warn "Snell v$major 重启失败。"; fi
+        else warn "Snell v$major 尚未安装。"; fi
+        pause_management_menu
+        ;;
+      7)
+        if [[ -n $i ]]; then
+          if ! (edit_instance "$i"); then warn "Snell v$major 配置修改操作未完成。"; pause_management_menu; fi
+        else warn "Snell v$major 尚未安装。"; pause_management_menu; fi
+        ;;
+      8)
+        if [[ -n $i ]]; then view_instance "$i"; else warn "Snell v$major 尚未安装。"; pause_management_menu; fi
+        ;;
+      9)
+        if [[ -n $i ]]; then view_instance_status "$i"; else warn "Snell v$major 尚未安装。"; pause_management_menu; fi
+        ;;
+      00) return ;;
       *) warn "无效选项。" ;;
     esac
-    discover_instances
-    for i in "${!INST_UNIT[@]}"; do [[ ${INST_UNIT[$i]} == "${INST_UNIT[$SELECTED_INDEX]:-}" ]] && break; done
   done
 }
 
 main_menu() {
-  local choice missing5=yes missing6=yes i
+  local choice
   while true; do
     discover_instances
-    for i in "${!INST_MAJOR[@]}"; do [[ ${INST_MAJOR[$i]} == 5 ]] && missing5=no; [[ ${INST_MAJOR[$i]} == 6 ]] && missing6=no; done
-    printf '\n=============================================\nSnell v5/v6 多实例管理器 v%s\n=============================================\n' "$SCRIPT_VERSION"
-    print_instances
-    printf '\n1. 管理现有实例\n2. 部署缺少的互补版本\n3. 只读审计\n0. 退出\n'
-    read -r -p "选择: " choice
+    printf '\n%s\nSnell v5/v6 多实例管理器 v%s\n%s\n' "$MENU_RULE" "$SCRIPT_VERSION" "$MENU_RULE"
+    printf '1.管理 Snell v5\n2.管理 Snell v6\n3.查看 当前配置\n'
+    printf '%s\n 00. 退出脚本\n%s\n\n' "$MENU_DIVIDER" "$MENU_RULE"
+    printf '当前状态:\t\n'
+    print_main_status
+    printf '\n\n'
+    read -r -p "请输入数字[0-9]:" choice
     case "$choice" in
-      1) select_instance && instance_menu "$SELECTED_INDEX" ;;
-      2)
-        missing5=yes; missing6=yes
-        for i in "${!INST_MAJOR[@]}"; do [[ ${INST_MAJOR[$i]} == 5 ]] && missing5=no; [[ ${INST_MAJOR[$i]} == 6 ]] && missing6=no; done
-        if [[ $missing5 == yes && $missing6 == yes ]]; then
-          read -r -p "部署 v5 或 v6？[5/6]: " choice; [[ $choice == 5 || $choice == 6 ]] || die "无效版本。"; deploy_major "$choice"
-        elif [[ $missing5 == yes ]]; then deploy_major 5
-        elif [[ $missing6 == yes ]]; then deploy_major 6
-        else info "v5 与 v6 均已存在，无需再部署。"
-        fi
-        ;;
-      3) audit ;;
-      0) exit 0 ;;
+      1) major_menu 5 ;;
+      2) major_menu 6 ;;
+      3) view_current_configs ;;
+      00) exit 0 ;;
       *) warn "无效选项。" ;;
     esac
   done
