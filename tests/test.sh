@@ -27,6 +27,33 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local haystack=$1 needle=$2 name=$3
+  if [[ $haystack != *"$needle"* ]]; then
+    printf 'ok - %s\n' "$name"
+  else
+    printf 'not ok - %s (unexpected=%q)\n' "$name" "$needle"
+    failures=$((failures+1))
+  fi
+}
+
+assert_before() {
+  local haystack=$1 first=$2 second=$3 name=$4
+  if [[ $haystack == *"$first"*"$second"* ]]; then
+    printf 'ok - %s\n' "$name"
+  else
+    printf 'not ok - %s (order=%q_before_%q)\n' "$name" "$first" "$second"
+    failures=$((failures+1))
+  fi
+}
+
+assert_cancel_step() {
+  local name=$1 input=$2 rc=0 output
+  shift 2
+  output=$(printf '%b' "$input" | "$@" 2>&1) || rc=$?
+  assert_eq 2 "$rc" "$name"
+}
+
 assert_eq "36847" "$(extract_port '::0:36847')" "parse legacy v5 listen"
 assert_eq "36884" "$(extract_port '0.0.0.0:36884,[::]:36884')" "parse v6 multi-listen"
 assert_eq "0.0.0.0:40000,[::]:40000" "$(replace_listen_port '0.0.0.0:36884,[::]:36884' 40000)" "replace all listen ports"
@@ -55,6 +82,9 @@ assert_eq "false" "$(yes_no_value '' false)" "blank yes/no keeps false default"
 assert_eq 'node = snell, 203.0.113.10, 11967, psk=secret, version=5, tfo=true, reuse=true, ecn=true' \
   "$(build_surge_line node 203.0.113.10 11967 secret 5 '' '' '' true true true)" \
   "xOS-style native v5 client line"
+assert_eq 'node = snell, 203.0.113.10, 11967, psk=secret, version=5, obfs=tls, obfs-host=cdn.example.com, tfo=true, reuse=true, ecn=true' \
+  "$(build_surge_line node 203.0.113.10 11967 secret 5 '' tls cdn.example.com true true true)" \
+  "xOS-style native v5 TLS client line"
 assert_eq 'node-v4 = snell, example.com, 11967, psk=secret, version=4, obfs=http, obfs-host=cdn.example.com, tfo=true, reuse=true, ecn=true' \
   "$(build_surge_line node-v4 example.com 11967 secret 4 '' http cdn.example.com true true true)" \
   "v4 compatibility client line"
@@ -65,6 +95,9 @@ write_server_config "$tmp/v5.conf" 5 11967 secret true '1.1.1.1, 8.8.8.8' false 
 assert_eq "http" "$(config_value "$tmp/v5.conf" obfs)" "render v5 HTTP obfs"
 assert_eq "cdn.example.com" "$(config_value "$tmp/v5.conf" obfs-host)" "render v5 obfs host"
 assert_eq "5" "$(config_value "$tmp/v5.conf" version)" "render v5 version"
+write_server_config "$tmp/v5-tls.conf" 5 11968 secret true '1.1.1.1' false tls tls.example.com
+assert_eq "tls" "$(config_value "$tmp/v5-tls.conf" obfs)" "render v5 TLS obfs"
+assert_eq "tls.example.com" "$(config_value "$tmp/v5-tls.conf" obfs-host)" "render v5 TLS host"
 write_server_config "$tmp/v6.conf" 6 25346 secret false '1.1.1.1' false off '' prefer-ipv4 unshaped
 assert_eq "0.0.0.0:25346,[::]:25346" "$(config_value "$tmp/v6.conf" listen)" "render v6 dual listen"
 assert_eq "prefer-ipv4" "$(config_value "$tmp/v6.conf" dns-ip-preference)" "render v6 DNS preference"
@@ -129,16 +162,18 @@ assert_contains "$view_output" $'IPv4 地址\t:' "instance configuration IPv4 fi
 assert_contains "$view_output" $'IPv6 地址\t:' "instance configuration IPv6 field"
 assert_contains "$view_output" "[信息]" "instance Surge information label"
 assert_contains "$view_output" "VM-TEST = snell, 203.0.113.10, 36894" "instance Surge line"
+assert_contains "$view_output" "* 按回车返回管理菜单 *" "instance returns to management menu"
 
 INST_LISTEN=('0.0.0.0:36894' '0.0.0.0:37681,[::]:37681')
 edit_v5_output=$(printf '0\n\n' | edit_instance 0 2>&1)
 assert_contains "$edit_v5_output" "当前配置摘要" "v5 editor summary title"
 assert_contains "$edit_v5_output" "$CONFIG_RULE" "v5 editor summary rule"
 assert_contains "$edit_v5_output" "1. 端口: 36894" "v5 editor numbers current values"
+assert_contains "$edit_v5_output" "2. PSK: summary-secret" "v5 editor shows plaintext PSK"
 assert_contains "$edit_v5_output" "6. IPv6: false" "v5 editor IPv6 field"
 assert_contains "$edit_v5_output" "8. OBFS Host:" "v5 editor OBFS host field"
-assert_contains "$(declare -f edit_instance)" 'read -r -p "请输入修改项[0-9]:"' "configuration editor uses requested prompt"
-assert_contains "$edit_v5_output" "* 按回车返回主菜单 *" "configuration editor return prompt"
+assert_contains "$edit_v5_output" "请输入修改项[0-9]:" "configuration editor uses requested prompt"
+assert_contains "$edit_v5_output" "* 按回车返回管理菜单 *" "configuration editor return prompt"
 
 edit_v6_output=$(printf '0\n\n' | edit_instance 1 2>&1)
 assert_contains "$edit_v6_output" "6. DNS IP 偏好: prefer-ipv4" "v6 editor DNS preference field"
@@ -148,20 +183,66 @@ MANAGED_ETC="$tmp/managed-etc"
 MANAGED_LIB="$tmp/managed-lib"
 SYSTEMD_DIR="$tmp/systemd"
 INST_MAJOR=()
+port_calls=0
+port_free() {
+  port_calls=$((port_calls+1))
+  ((port_calls > 1))
+}
+install_set_port < <(printf '\n3456\n') >"$tmp/port-retry-output" 2>&1
+assert_eq "3456" "$INSTALL_PORT" "occupied default port is entered again"
+assert_contains "$(<"$tmp/port-retry-output")" "已被占用" "occupied port warning is visible"
+
+install_set_psk 5 < <(printf 'short\n1234567890abcdef\n') >"$tmp/psk-retry-output" 2>&1
+assert_eq "1234567890abcdef" "$INSTALL_PSK" "invalid v5 PSK is entered again"
+assert_contains "$(<"$tmp/psk-retry-output")" "16 到 255 位" "invalid PSK warning is visible"
+
+install_set_mode < <(printf '3\nNO\n2\n') >"$tmp/mode-retry-output" 2>&1
+assert_eq "unshaped" "$INSTALL_MODE" "unconfirmed unsafe-raw returns to mode selection"
+
 port_free() { return 0; }
 deploy_v5_output=$(printf '\n\n\n\n\n\nN\n' | deploy_major 5 2>&1)
 deploy_source=$(declare -f deploy_major)
-assert_contains "$deploy_source" 'read -r -p "端口（默认 ${port}）: "' "install port prompt"
-assert_contains "$deploy_source" 'read -r -p "TCP Fast Open？[Y/n]: "' "v5 install TFO prompt"
-assert_contains "$deploy_source" 'read -r -p "IPv6：[y/N]: "' "v5 install IPv6 prompt"
+assert_contains "$deploy_v5_output" "请输入 Snell Server 端口" "xOS-style install port prompt"
+assert_contains "$deploy_v5_output" "请输入 Snell Server 密钥" "xOS-style install PSK prompt"
+assert_contains "$deploy_v5_output" "配置 OBFS" "xOS-style v5 OBFS prompt"
+assert_contains "$deploy_v5_output" "是否开启 IPv6 解析？" "xOS-style v5 IPv6 prompt"
+assert_contains "$deploy_v5_output" "是否开启 TCP Fast Open？" "xOS-style v5 TFO prompt"
+assert_contains "$deploy_v5_output" "默认值" "xOS-style DNS prompt"
+assert_contains "$deploy_v5_output" "$INSTALL_RULE" "install option pages use xOS rule"
 assert_contains "$deploy_v5_output" "端口: 2345" "deployment summary port label"
 assert_contains "$deploy_v5_output" "TFO: true" "deployment summary TFO label"
 assert_contains "$deploy_v5_output" "IPv6: false" "deployment summary IPv6 label"
+assert_contains "$deploy_v5_output" "PSK: " "deployment summary includes PSK"
+assert_not_contains "$deploy_v5_output" "PSK: [已设置" "deployment summary does not mask PSK"
+assert_before "$deploy_v5_output" "配置 OBFS" "是否开启 IPv6 解析？" "v5 OBFS precedes IPv6"
+assert_before "$deploy_v5_output" "是否开启 IPv6 解析？" "是否开启 TCP Fast Open？" "v5 IPv6 precedes TFO"
+assert_before "$deploy_v5_output" "是否开启 TCP Fast Open？" "请输入正确格式的 DNS" "v5 TFO precedes DNS"
 
 deploy_v6_output=$(printf '\n\n\n\n\n\nN\n' | deploy_major 6 2>&1)
-assert_contains "$deploy_source" 'read -r -p "TCP Fast Open[Y/n]: "' "v6 install TFO prompt"
-assert_contains "$deploy_source" 'read -r -p "DNS IP 偏好（默认 default）: "' "v6 install DNS preference prompt"
-assert_contains "$deploy_source" 'read -r -p "v6 mode（默认 default，可选 unshaped/unsafe-raw）: "' "v6 install mode prompt"
+assert_contains "$deploy_v6_output" "是否开启 TCP Fast Open？" "v6 install TFO prompt"
+assert_contains "$deploy_v6_output" "配置 DNS IP 偏好" "v6 install DNS preference prompt"
+assert_contains "$deploy_v6_output" "配置 混淆模式" "v6 install mode prompt"
+assert_not_contains "$deploy_v6_output" "配置 OBFS" "v6 install omits OBFS"
+assert_not_contains "$deploy_v6_output" "是否开启 IPv6 解析？" "v6 install omits IPv6 resolver prompt"
+assert_before "$deploy_v6_output" "是否开启 TCP Fast Open？" "请输入正确格式的 DNS" "v6 TFO precedes DNS"
+assert_before "$deploy_v6_output" "配置 DNS IP 偏好" "配置 混淆模式" "v6 DNS preference precedes mode"
+
+assert_cancel_step "port step supports 00 cancellation" '00\n' install_set_port
+assert_cancel_step "v5 PSK step supports 00 cancellation" '00\n' install_set_psk 5
+assert_cancel_step "v6 PSK step supports 00 cancellation" '00\n' install_set_psk 6
+assert_cancel_step "OBFS step supports 00 cancellation" '00\n' install_set_obfs
+assert_cancel_step "IPv6 step supports 00 cancellation" '00\n' install_set_ipv6
+assert_cancel_step "TFO step supports 00 cancellation" '00\n' install_set_tfo
+assert_cancel_step "DNS step supports 00 cancellation" '00\n' install_set_dns
+assert_cancel_step "DNS preference supports 00 cancellation" '00\n' install_set_dns_preference
+assert_cancel_step "mode supports 00 cancellation" '00\n' install_set_mode
+assert_cancel_step "unsafe-raw confirmation supports 00 cancellation" '3\n00\n' install_set_mode
+
+install_set_obfs < <(printf '1\nexample.com\n') >"$tmp/tls-output" 2>&1
+tls_output=$(<"$tmp/tls-output")
+assert_eq "tls" "$INSTALL_OBFS" "OBFS menu selects TLS"
+assert_eq "example.com" "$INSTALL_OBFS_HOST" "OBFS menu stores TLS host"
+assert_contains "$tls_output" "OBFS 状态" "OBFS result is displayed"
 
 INST_VERSION=(5.0.1)
 INST_MAJOR=(5)
@@ -169,8 +250,8 @@ INST_BIN=("$tmp/snell-server")
 INST_UNIT=(snell-v5.service)
 update_output=$(printf 'N\n\n' | update_instance 0 2>&1)
 assert_contains "$update_output" "当前 v5.0.1；目标官方包 5.0.1。" "update confirmation versions"
-assert_contains "$(declare -f update_instance)" 'read -r -p "确认更新 [y/N]: "' "update confirmation prompt"
-assert_contains "$update_output" "* 按回车返回主菜单 *" "update return prompt"
+assert_contains "$update_output" "确认更新 [y/N]: " "update confirmation prompt"
+assert_contains "$update_output" "* 按回车返回管理菜单 *" "update return prompt"
 
 fake_systemctl() {
   printf '%s\n' '● snell-v5.service - Snell v5 managed instance' \
@@ -182,7 +263,9 @@ SYSTEMCTL_BIN=fake_systemctl
 status_output=$(printf '\n' | view_instance_status 0 2>&1)
 assert_contains "$status_output" "● snell-v5.service - Snell v5 managed instance" "status page service output"
 assert_contains "$status_output" "$CONFIG_RULE" "status page rule"
-assert_contains "$status_output" "* 按回车返回主菜单 *" "status page return prompt"
+assert_contains "$status_output" "* 按回车返回管理菜单 *" "status page return prompt"
+assert_contains "$(declare -f firewall_offer)" "[y/N]: " "firewall confirmation defaults to no"
+assert_not_contains "$(declare -f firewall_offer)" "answer=y" "firewall blank input does not auto-approve"
 
 if ((failures)); then
   printf '%s test(s) failed\n' "$failures" >&2
