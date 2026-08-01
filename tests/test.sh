@@ -39,6 +39,30 @@ assert_eq "31325" "$(extract_port "$(config_value "$tmp/config.conf" listen)")" 
 write_key_to_temp "$tmp/config.conf" "$tmp/changed.conf" listen '::0:32000'
 assert_eq "::0:32000" "$(config_value "$tmp/changed.conf" listen)" "atomic value rewrite"
 assert_eq "[REDACTED]" "$(redacted_config "$tmp/config.conf" | awk -F'= ' '/psk/{print $2}')" "audit masks PSK"
+assert_eq '[2001:db8::1]' "$(surge_endpoint '2001:db8::1')" "bracket IPv6 client endpoint"
+assert_eq "true" "$(yes_no_value '' true)" "blank yes/no keeps true default"
+assert_eq "false" "$(yes_no_value '' false)" "blank yes/no keeps false default"
+assert_eq 'node = snell, 203.0.113.10, 11967, psk=secret, version=5, tfo=true, reuse=true, ecn=true' \
+  "$(build_surge_line node 203.0.113.10 11967 secret 5 '' '' '' true true true)" \
+  "xOS-style native v5 client line"
+assert_eq 'node-v4 = snell, example.com, 11967, psk=secret, version=4, obfs=http, obfs-host=cdn.example.com, tfo=true, reuse=true, ecn=true' \
+  "$(build_surge_line node-v4 example.com 11967 secret 4 '' http cdn.example.com true true true)" \
+  "v4 compatibility client line"
+assert_eq 'node-v6 = snell, [2001:db8::1], 25346, psk=secret, version=6, mode=unshaped, tfo=true, reuse=true, ecn=true' \
+  "$(build_surge_line node-v6 '2001:db8::1' 25346 secret 6 unshaped '' '' true true true)" \
+  "xOS-style v6 client line"
+write_server_config "$tmp/v5.conf" 5 11967 secret true '1.1.1.1, 8.8.8.8' false http cdn.example.com
+assert_eq "http" "$(config_value "$tmp/v5.conf" obfs)" "render v5 HTTP obfs"
+assert_eq "cdn.example.com" "$(config_value "$tmp/v5.conf" obfs-host)" "render v5 obfs host"
+assert_eq "5" "$(config_value "$tmp/v5.conf" version)" "render v5 version"
+write_server_config "$tmp/v6.conf" 6 25346 secret false '1.1.1.1' false off '' prefer-ipv4 unshaped
+assert_eq "0.0.0.0:25346,[::]:25346" "$(config_value "$tmp/v6.conf" listen)" "render v6 dual listen"
+assert_eq "prefer-ipv4" "$(config_value "$tmp/v6.conf" dns-ip-preference)" "render v6 DNS preference"
+assert_eq "unshaped" "$(config_value "$tmp/v6.conf" mode)" "render v6 mode"
+psk5=$(random_psk 5)
+psk6=$(random_psk 6)
+assert_eq "16" "${#psk5}" "xOS default v5 PSK length"
+assert_eq "20" "${#psk6}" "xOS default v6 PSK length"
 
 if ((failures)); then
   printf '%s test(s) failed\n' "$failures" >&2
