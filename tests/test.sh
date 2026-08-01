@@ -17,6 +17,16 @@ assert_eq() {
   fi
 }
 
+assert_contains() {
+  local haystack=$1 needle=$2 name=$3
+  if [[ $haystack == *"$needle"* ]]; then
+    printf 'ok - %s\n' "$name"
+  else
+    printf 'not ok - %s (missing=%q)\n' "$name" "$needle"
+    failures=$((failures+1))
+  fi
+}
+
 assert_eq "36847" "$(extract_port '::0:36847')" "parse legacy v5 listen"
 assert_eq "36884" "$(extract_port '0.0.0.0:36884,[::]:36884')" "parse v6 multi-listen"
 assert_eq "0.0.0.0:40000,[::]:40000" "$(replace_listen_port '0.0.0.0:36884,[::]:36884' 40000)" "replace all listen ports"
@@ -63,6 +73,36 @@ psk5=$(random_psk 5)
 psk6=$(random_psk 6)
 assert_eq "16" "${#psk5}" "xOS default v5 PSK length"
 assert_eq "20" "${#psk6}" "xOS default v6 PSK length"
+
+write_server_config "$tmp/summary-v5.conf" 5 36894 summary-secret true '1.1.1.1' false off
+INST_CONF=("$tmp/summary-v5.conf")
+INST_PORT=(36894)
+INST_MAJOR=(5)
+assert_eq 'US TEST = snell, 203.0.113.10, 36894, psk=summary-secret, version=5, reuse=true, tfo=true, ecn=true' \
+  "$(summary_surge_line 0 203.0.113.10 'US TEST')" \
+  "current config line with TFO and ECN"
+INST_CONF=("$tmp/config.conf")
+INST_PORT=(31325)
+INST_MAJOR=(5)
+assert_eq 'US LEGACY = snell, 198.51.100.20, 31325, psk=secret-value, version=5, reuse=true' \
+  "$(summary_surge_line 0 198.51.100.20 'US LEGACY')" \
+  "legacy current config line without TFO"
+INST_MAJOR=(5 6)
+find_major_instance 6
+assert_eq "1" "$MAJOR_INDEX" "select instance by major version"
+INST_ACTIVE=(active inactive)
+discover_instances() { :; }
+main_output=$(printf '00\n' | main_menu)
+assert_contains "$main_output" "1.管理 Snell v5" "new main menu v5 entry"
+assert_contains "$main_output" "3.查看 当前配置" "new main menu current config entry"
+assert_contains "$main_output" "$MENU_RULE" "main menu xOS title rule"
+assert_contains "$main_output" "$MENU_DIVIDER" "main menu xOS divider"
+assert_contains "$main_output" "v5:" "mixed main status includes v5"
+major_output=$(printf '00\n' | major_menu 5)
+assert_contains "$major_output" "1.安装 Snell v5" "v5 management install entry"
+assert_contains "$major_output" "9.查看 运行状态" "version management status entry"
+assert_contains "$major_output" "$MENU_DIVIDER" "management uses xOS divider"
+assert_contains "$major_output" "00. 返回" "version management return entry"
 
 if ((failures)); then
   printf '%s test(s) failed\n' "$failures" >&2

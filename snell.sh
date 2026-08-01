@@ -18,6 +18,8 @@ GREEN='\033[32m'
 YELLOW='\033[33m'
 RED='\033[31m'
 RESET='\033[0m'
+MENU_RULE='=============================='
+MENU_DIVIDER='——————————————————————————————'
 
 declare -a INST_UNIT=() INST_BIN=() INST_CONF=() INST_VERSION=() INST_MAJOR=()
 declare -a INST_PORT=() INST_LISTEN=() INST_ACTIVE=() INST_ENABLED=() INST_MANAGED=()
@@ -280,30 +282,41 @@ print_default_surge_configs() {
   printf '\n默认沿用 xOS 偏好：客户端 TFO=%s、ECN=true；可从实例菜单重新生成。\n' "$server_tfo"
 }
 
-client_config_menu() {
-  local i=$1 psk endpoint detected name answer client_tfo client_ecn server_tfo
+summary_surge_line() {
+  local i=$1 endpoint=$2 name=$3 psk tfo mode obfs obfs_host line
   psk=$(config_value "${INST_CONF[$i]}" psk)
-  [[ -n $psk && -n ${INST_PORT[$i]} ]] || die "配置缺少 PSK 或有效端口。"
-  detected=$(public_ipv4)
-  if [[ -n $detected ]]; then
-    read -r -p "服务器地址（默认 $detected，可输入域名或 IPv6）: " endpoint
-    [[ -n $endpoint ]] || endpoint=$detected
-  else
-    read -r -p "服务器地址（IPv4、IPv6 或域名）: " endpoint
-    [[ -n $endpoint ]] || die "服务器地址不能为空。"
+  [[ -n $endpoint && -n ${INST_PORT[$i]} && -n $psk ]] || return 1
+  tfo=$(config_value "${INST_CONF[$i]}" tfo)
+  mode=$(config_value "${INST_CONF[$i]}" mode)
+  obfs=$(config_value "${INST_CONF[$i]}" obfs)
+  obfs_host=$(config_value "${INST_CONF[$i]}" obfs-host)
+  line="$name = snell, $(surge_endpoint "$endpoint"), ${INST_PORT[$i]}, psk=$psk, version=${INST_MAJOR[$i]}"
+  [[ ${INST_MAJOR[$i]} != 6 ]] || line+=", mode=${mode:-default}"
+  if [[ ${INST_MAJOR[$i]} == 5 && $obfs == http ]]; then
+    line+=", obfs=http"
+    [[ -n $obfs_host ]] && line+=", obfs-host=$obfs_host"
   fi
-  read -r -p "节点名称前缀（默认 $(hostname)）: " name
-  [[ -n $name ]] || name="$(hostname)"
-  [[ $name != *,* ]] || die "节点名称不能包含逗号。"
+  line+=", reuse=true"
+  if [[ $tfo == true || $tfo == false ]]; then
+    line+=", tfo=$tfo, ecn=true"
+  fi
+  printf '%s' "$line"
+}
 
-  server_tfo=$(config_value "${INST_CONF[$i]}" tfo)
-  [[ $server_tfo == true || $server_tfo == false ]] || server_tfo=true
-  read -r -p "客户端启用 TCP Fast Open？（默认沿用服务端：$server_tfo）[y/n]: " answer
-  client_tfo=$(yes_no_value "$answer" "$server_tfo")
-  read -r -p "客户端启用 ECN？不兼容网络可能连接失败 [Y/n]: " answer
-  client_ecn=$(yes_no_value "$answer" true)
-  print_surge_configs "$i" "$endpoint" "$name" "$client_tfo" "$client_ecn"
-  printf '\n说明：服务端 tfo 与以上客户端 tfo 是两个独立开关；reuse/ecn 按 xOS 输出偏好生成。\n'
+view_current_configs() {
+  discover_instances
+  local endpoint name base i count=${#INST_UNIT[@]}
+  ((count)) || { warn "未发现 Snell v5/v6 实例。"; return; }
+  endpoint=$(public_ipv4)
+  [[ -n $endpoint ]] || { warn "无法获取公网 IPv4，暂时不能生成 Surge 配置。"; return; }
+  base=$(hostname)
+  printf '\n当前 Surge 配置：\n\n'
+  for i in "${!INST_UNIT[@]}"; do
+    name=$base
+    ((count == 1)) || name="$base v${INST_MAJOR[$i]}"
+    summary_surge_line "$i" "$endpoint" "$name" || warn "${INST_UNIT[$i]} 缺少端口或 PSK，无法生成。"
+    printf '\n'
+  done
 }
 
 view_instance() {
@@ -651,10 +664,10 @@ update_instance() {
 
 remove_managed_instance() {
   local i=$1 confirm unit conf bin
-  [[ ${INST_MANAGED[$i]} == yes ]] || die "旧实例只原地管理，不允许脚本删除。"
+  [[ ${INST_MANAGED[$i]} == yes ]] || { warn "旧实例只原地管理，不允许脚本删除。"; return 1; }
   unit=${INST_UNIT[$i]}; conf=${INST_CONF[$i]}; bin=${INST_BIN[$i]}
   read -r -p "输入服务名 $unit 确认卸载: " confirm
-  [[ $confirm == "$unit" ]] || die "确认不匹配，已取消。"
+  [[ $confirm == "$unit" ]] || { warn "确认不匹配，已取消。"; return 1; }
   "$SYSTEMCTL_BIN" disable --now "$unit"
   rm -f "$SYSTEMD_DIR/$unit" "$conf" "$bin"
   rmdir "${conf%/*}" "${bin%/*}" 2>/dev/null || true
@@ -663,62 +676,116 @@ remove_managed_instance() {
   discover_instances
 }
 
-select_instance() {
-  local selection
-  ((${#INST_UNIT[@]})) || return 1
-  read -r -p "实例编号: " selection
-  [[ $selection =~ ^[0-9]+$ && $selection -ge 1 && $selection -le ${#INST_UNIT[@]} ]] || die "无效编号。"
-  SELECTED_INDEX=$((selection-1))
+find_major_instance() {
+  local major=$1 i
+  MAJOR_INDEX=""
+  for i in "${!INST_MAJOR[@]}"; do
+    if [[ ${INST_MAJOR[$i]} == "$major" ]]; then
+      MAJOR_INDEX=$i
+      return 0
+    fi
+  done
+  return 1
 }
 
-instance_menu() {
-  local i=$1 choice
+print_major_status() {
+  local major=$1 i=""
+  find_major_instance "$major" && i=$MAJOR_INDEX
+  if [[ -z $i ]]; then
+    printf '%b未安装%b' "$RED" "$RESET"
+  elif [[ ${INST_ACTIVE[$i]} == active ]]; then
+    printf '%b已安装%b%b[v%s]%b且%b已启动%b' \
+      "$GREEN" "$RESET" "$YELLOW" "$major" "$RESET" "$GREEN" "$RESET"
+  else
+    printf '%b已安装%b%b[v%s]%b但%b未启动%b' \
+      "$GREEN" "$RESET" "$YELLOW" "$major" "$RESET" "$RED" "$RESET"
+  fi
+}
+
+print_main_status() {
+  local i5="" i6=""
+  find_major_instance 5 && i5=$MAJOR_INDEX
+  find_major_instance 6 && i6=$MAJOR_INDEX
+  if [[ -z $i5 && -z $i6 ]]; then
+    printf '%b未安装 Snell v5/v6%b' "$RED" "$RESET"
+  elif [[ -n $i5 && -n $i6 && ${INST_ACTIVE[$i5]} == active && ${INST_ACTIVE[$i6]} == active ]]; then
+    printf '%b已安装%b%b[v5]%b & %b[v6]%b且%b已启动%b' \
+      "$GREEN" "$RESET" "$YELLOW" "$RESET" "$YELLOW" "$RESET" "$GREEN" "$RESET"
+  else
+    printf 'v5: '
+    print_major_status 5
+    printf ' | v6: '
+    print_major_status 6
+  fi
+}
+
+major_menu() {
+  local major=$1 choice i
   while true; do
-    printf '\n[%s / v%s / %s]\n' "${INST_UNIT[$i]}" "${INST_VERSION[$i]}" "${INST_ACTIVE[$i]}"
-    printf '1. 查看服务端配置\n2. 生成 Surge 客户端配置\n3. 启动\n4. 停止\n5. 重启\n6. 查看状态\n7. 查看日志\n8. 修改配置\n9. 同版本更新\n10. 卸载脚本托管实例\n0. 返回\n'
-    read -r -p "选择: " choice
+    discover_instances
+    i=""
+    find_major_instance "$major" && i=$MAJOR_INDEX
+    printf '\n%s\nSnell v%s 管理\n%s\n' "$MENU_RULE" "$major" "$MENU_RULE"
+    printf '1.安装 Snell v%s\n2.卸载 Snell v%s\n3.更新 当前配置\n' "$major" "$major"
+    printf '%s\n' "$MENU_DIVIDER"
+    printf '4.启动 Snell v%s\n5.停止 Snell v%s\n6.重启 Snell v%s\n' "$major" "$major" "$major"
+    printf '%s\n' "$MENU_DIVIDER"
+    printf '7.设置 配置信息\n8.查看 配置信息\n9.查看 运行状态\n'
+    printf '%s\n 00. 返回\n%s\n\n' "$MENU_DIVIDER" "$MENU_RULE"
+    printf ' 当前状态: '
+    print_major_status "$major"
+    printf '\n\n'
+    read -r -p " 请输入数字[0-9]:" choice
     case "$choice" in
-      1) view_instance "$i" ;;
-      2) client_config_menu "$i" ;;
-      3) "$SYSTEMCTL_BIN" start "${INST_UNIT[$i]}" ;;
-      4) "$SYSTEMCTL_BIN" stop "${INST_UNIT[$i]}" ;;
-      5) "$SYSTEMCTL_BIN" restart "${INST_UNIT[$i]}" ;;
-      6) "$SYSTEMCTL_BIN" status "${INST_UNIT[$i]}" --no-pager || true ;;
-      7) journalctl -u "${INST_UNIT[$i]}" -n 50 --no-pager | sed -E 's/(psk[=: ]+)[^ ,]+/\1[REDACTED]/Ig' ;;
-      8) edit_instance "$i"; discover_instances; return ;;
-      9) update_instance "$i"; discover_instances; return ;;
-      10) remove_managed_instance "$i"; return ;;
-      0) return ;;
+      1)
+        if [[ -n $i ]]; then warn "Snell v$major 已安装：${INST_UNIT[$i]}"; else deploy_major "$major"; fi
+        ;;
+      2)
+        if [[ -n $i ]]; then remove_managed_instance "$i" || true; else warn "Snell v$major 尚未安装。"; fi
+        ;;
+      3)
+        if [[ -n $i ]]; then update_instance "$i"; else warn "Snell v$major 尚未安装。"; fi
+        ;;
+      4)
+        if [[ -n $i ]]; then "$SYSTEMCTL_BIN" start "${INST_UNIT[$i]}" && info "Snell v$major 已启动。"; else warn "Snell v$major 尚未安装。"; fi
+        ;;
+      5)
+        if [[ -n $i ]]; then "$SYSTEMCTL_BIN" stop "${INST_UNIT[$i]}" && info "Snell v$major 已停止。"; else warn "Snell v$major 尚未安装。"; fi
+        ;;
+      6)
+        if [[ -n $i ]]; then "$SYSTEMCTL_BIN" restart "${INST_UNIT[$i]}" && info "Snell v$major 已重启。"; else warn "Snell v$major 尚未安装。"; fi
+        ;;
+      7)
+        if [[ -n $i ]]; then edit_instance "$i"; else warn "Snell v$major 尚未安装。"; fi
+        ;;
+      8)
+        if [[ -n $i ]]; then view_instance "$i"; else warn "Snell v$major 尚未安装。"; fi
+        ;;
+      9)
+        if [[ -n $i ]]; then "$SYSTEMCTL_BIN" status "${INST_UNIT[$i]}" --no-pager || true; else warn "Snell v$major 尚未安装。"; fi
+        ;;
+      00) return ;;
       *) warn "无效选项。" ;;
     esac
-    discover_instances
-    for i in "${!INST_UNIT[@]}"; do [[ ${INST_UNIT[$i]} == "${INST_UNIT[$SELECTED_INDEX]:-}" ]] && break; done
   done
 }
 
 main_menu() {
-  local choice missing5=yes missing6=yes i
+  local choice
   while true; do
     discover_instances
-    for i in "${!INST_MAJOR[@]}"; do [[ ${INST_MAJOR[$i]} == 5 ]] && missing5=no; [[ ${INST_MAJOR[$i]} == 6 ]] && missing6=no; done
-    printf '\n=============================================\nSnell v5/v6 多实例管理器 v%s\n=============================================\n' "$SCRIPT_VERSION"
-    print_instances
-    printf '\n1. 管理现有实例\n2. 部署缺少的互补版本\n3. 只读审计\n0. 退出\n'
-    read -r -p "选择: " choice
+    printf '\n%s\nSnell v5/v6 多实例管理器 v%s\n%s\n' "$MENU_RULE" "$SCRIPT_VERSION" "$MENU_RULE"
+    printf '1.管理 Snell v5\n2.管理 Snell v6\n3.查看 当前配置\n'
+    printf '%s\n 00. 退出脚本\n%s\n\n' "$MENU_DIVIDER" "$MENU_RULE"
+    printf ' 当前状态: '
+    print_main_status
+    printf '\n\n'
+    read -r -p " 请输入数字[0-9]:" choice
     case "$choice" in
-      1) select_instance && instance_menu "$SELECTED_INDEX" ;;
-      2)
-        missing5=yes; missing6=yes
-        for i in "${!INST_MAJOR[@]}"; do [[ ${INST_MAJOR[$i]} == 5 ]] && missing5=no; [[ ${INST_MAJOR[$i]} == 6 ]] && missing6=no; done
-        if [[ $missing5 == yes && $missing6 == yes ]]; then
-          read -r -p "部署 v5 或 v6？[5/6]: " choice; [[ $choice == 5 || $choice == 6 ]] || die "无效版本。"; deploy_major "$choice"
-        elif [[ $missing5 == yes ]]; then deploy_major 5
-        elif [[ $missing6 == yes ]]; then deploy_major 6
-        else info "v5 与 v6 均已存在，无需再部署。"
-        fi
-        ;;
-      3) audit ;;
-      0) exit 0 ;;
+      1) major_menu 5 ;;
+      2) major_menu 6 ;;
+      3) view_current_configs ;;
+      00) exit 0 ;;
       *) warn "无效选项。" ;;
     esac
   done
