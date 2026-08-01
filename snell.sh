@@ -442,32 +442,28 @@ apply_config_change() {
   warn "新配置启动失败，正在恢复。"
   cp -a "$backup" "$conf"
   "$SYSTEMCTL_BIN" restart "$unit" || true
-  "$SYSTEMCTL_BIN" is-active --quiet "$unit" || die "回滚后服务仍未恢复，请检查 $unit。"
+  "$SYSTEMCTL_BIN" is-active --quiet "$unit" || die "回滚后服务仍未恢复，请检查 ${unit}。"
   die "已回滚本次配置修改。"
 }
 
 edit_instance() {
   local i=$1 choice key value port current display_value psk
   psk=$(config_value "${INST_CONF[$i]}" psk)
-  printf '\n当前配置摘要\n端口: %s\nPSK: [已设置，%s 位]\nTFO: %s\nDNS: %s\n出口接口: %s\n' \
+  printf '\n当前配置摘要\n%b%s%b\n' "$GREEN" "$CONFIG_RULE" "$RESET"
+  printf '1. 端口: %s\n2. PSK: [已设置，%s 位]\n3. TFO: %s\n4. DNS: %s\n5. 出口: %s\n' \
     "${INST_PORT[$i]:--}" "${#psk}" "$(config_value "${INST_CONF[$i]}" tfo)" \
     "$(config_value "${INST_CONF[$i]}" dns)" "$(config_value "${INST_CONF[$i]}" egress-interface)"
   if [[ ${INST_MAJOR[$i]} == 5 ]]; then
-    printf 'IPv6 目标解析: %s\nOBFS: %s\nOBFS Host: %s\n' \
+    printf '6. IPv6: %s\n7. OBFS: %s\n8. OBFS Host: %s\n' \
       "$(config_value "${INST_CONF[$i]}" ipv6)" "$(config_value "${INST_CONF[$i]}" obfs)" \
       "$(config_value "${INST_CONF[$i]}" obfs-host)"
   else
-    printf 'DNS IP 偏好: %s\nmode: %s\nlisten: %s\n' \
+    printf '6. DNS IP 偏好: %s\n7. mode: %s\n8. listen: %s\n' \
       "$(config_value "${INST_CONF[$i]}" dns-ip-preference)" "$(config_value "${INST_CONF[$i]}" mode)" \
       "${INST_LISTEN[$i]}"
   fi
-  printf '\n1. 端口\n2. PSK\n3. TFO\n4. DNS\n5. 出口接口\n'
-  if [[ ${INST_MAJOR[$i]} == 5 ]]; then
-    printf '6. IPv6 解析\n7. OBFS\n8. OBFS Host\n'
-  else
-    printf '6. DNS IP 偏好\n7. mode\n8. listen（完整值）\n'
-  fi
-  read -r -p "选择配置项: " choice
+  printf '%b%s%b\n' "$GREEN" "$CONFIG_RULE" "$RESET"
+  read -r -p "请输入修改项[0-9]:" choice
   case "$choice" in
     1)
       read -r -p "新端口: " port
@@ -514,6 +510,11 @@ edit_instance() {
         done < <(tr ',' '\n' <<< "$value")
         port_free "$port" "${INST_PORT[$i]}" || die "listen 端口已被占用。"
       fi
+      ;;
+    0|00|"")
+      printf '%b%s%b\n\n%b* 按回车返回主菜单 *%b' "$GREEN" "$CONFIG_RULE" "$RESET" "$YELLOW" "$RESET"
+      read -r
+      return 0
       ;;
     *) die "无效选项。" ;;
   esac
@@ -599,20 +600,24 @@ deploy_major() {
   port=2345
   if ! port_free "$port"; then
     port=$(random_port) || die "默认端口 2345 已占用，且未能找到其他空闲端口。"
-    warn "xOS 默认端口 2345 已占用，本次改用空闲端口 $port。"
+    warn "xOS 默认端口 2345 已占用，本次改用空闲端口 ${port}。"
   fi
-  read -r -p "监听端口（默认 $port）: " choice; [[ -z $choice ]] || port=$choice
+  read -r -p "端口（默认 ${port}）: " choice; [[ -z $choice ]] || port=$choice
   port_free "$port" || die "端口无效或已被占用。"
   psk=$(random_psk "$major") || die "未能生成随机 PSK。"
   read -r -p "PSK（留空按 xOS 默认生成：v5 16位 / v6 20位）: " choice; [[ -z $choice ]] || psk=$choice
   [[ ${#psk} -ge 16 && ${#psk} -le 255 ]] || die "PSK 必须为 16–255 位。"
 
-  read -r -p "服务端启用 TCP Fast Open？[Y/n]: " choice
+  if [[ $major == 5 ]]; then
+    read -r -p "TCP Fast Open？[Y/n]: " choice
+  else
+    read -r -p "TCP Fast Open[Y/n]: " choice
+  fi
   [[ ! $choice =~ ^[Nn]$ ]] || server_tfo=false
-  read -r -p "DNS（默认 $dns）: " choice; [[ -z $choice ]] || dns=$choice
+  read -r -p "DNS（默认 ${dns}）: " choice; [[ -z $choice ]] || dns=$choice
   [[ -n $dns ]] || die "DNS 不能为空。"
   if [[ $major == 5 ]]; then
-    read -r -p "允许解析并连接 IPv6 目标？[y/N]: " choice
+    read -r -p "IPv6：[y/N]: " choice
     ipv6=$(yes_no_value "$choice")
     read -r -p "OBFS（默认 off，可输入 http）: " choice
     [[ -z $choice ]] || obfs=$choice
@@ -635,10 +640,10 @@ deploy_major() {
   fi
 
   printf '\n部署摘要（不会修改现有实例）\n'
-  printf '版本: v%s\n服务: %s\n监听端口: %s\nPSK: [已设置，%s 位]\n服务端 TFO: %s\nDNS: %s\n' \
+  printf '版本: v%s\n服务: %s\n端口: %s\nPSK: [已设置，%s 位]\nTFO: %s\nDNS: %s\n' \
     "$major" "$unit" "$port" "${#psk}" "$server_tfo" "$dns"
   if [[ $major == 5 ]]; then
-    printf 'IPv6 目标解析: %s\nOBFS: %s\n' "$ipv6" "$obfs"
+    printf 'IPv6: %s\nOBFS: %s\n' "$ipv6" "$obfs"
     [[ $obfs == http ]] && printf 'OBFS Host: %s\n' "$obfs_host"
   else
     printf 'DNS IP 偏好: %s\nmode: %s\n' "$dns_ip_pref" "$mode"
@@ -699,9 +704,13 @@ update_instance() {
   local stage backup choice expected_version current
   current=${INST_VERSION[$i]}
   expected_version=$([[ $major == 5 ]] && printf '%s' "$V5_VERSION" || printf '%s' "$V6_PACKAGE_VERSION")
-  printf '当前 v%s；目标官方包 %s。将只更新 %s。\n' "$current" "$expected_version" "$unit"
-  read -r -p "继续？[y/N]: " choice
-  [[ $choice =~ ^[Yy]$ ]] || return 0
+  printf '当前 v%s；目标官方包 %s。\n' "$current" "$expected_version"
+  read -r -p "确认更新 [y/N]: " choice
+  if [[ ! $choice =~ ^[Yy]$ ]]; then
+    printf '%b%s%b\n\n%b* 按回车返回主菜单 *%b' "$GREEN" "$CONFIG_RULE" "$RESET" "$YELLOW" "$RESET"
+    read -r
+    return 0
+  fi
   stage=$(mktemp -d /tmp/snell-manager-update.XXXXXX)
   download_official "$major" "$stage"
   backup="${bin}.backup-$(date +%Y%m%d-%H%M%S)"
@@ -715,6 +724,8 @@ update_instance() {
     "$SYSTEMCTL_BIN" restart "$unit" || true
     die "更新已回滚。"
   fi
+  printf '%b%s%b\n\n%b* 按回车返回主菜单 *%b' "$GREEN" "$CONFIG_RULE" "$RESET" "$YELLOW" "$RESET"
+  read -r
 }
 
 remove_managed_instance() {
@@ -727,7 +738,7 @@ remove_managed_instance() {
   rm -f "$SYSTEMD_DIR/$unit" "$conf" "$bin"
   rmdir "${conf%/*}" "${bin%/*}" 2>/dev/null || true
   "$SYSTEMCTL_BIN" daemon-reload
-  info "已删除脚本托管实例 $unit；该操作不恢复防火墙规则。"
+  info "已删除脚本托管实例 ${unit}；该操作不恢复防火墙规则。"
   discover_instances
 }
 
@@ -760,8 +771,15 @@ print_major_status() {
 print_main_status() {
   printf 'v5: '
   print_major_status 5
-  printf '\n\t\tv6: '
+  printf '\nv6: '
   print_major_status 6
+}
+
+view_instance_status() {
+  local i=$1
+  "$SYSTEMCTL_BIN" status "${INST_UNIT[$i]}" --no-pager || true
+  printf '%b%s%b\n\n%b* 按回车返回主菜单 *%b' "$GREEN" "$CONFIG_RULE" "$RESET" "$YELLOW" "$RESET"
+  read -r
 }
 
 major_menu() {
@@ -777,10 +795,10 @@ major_menu() {
     printf '%s\n' "$MENU_DIVIDER"
     printf '7.设置 配置信息\n8.查看 配置信息\n9.查看 运行状态\n'
     printf '%s\n 00. 返回\n%s\n\n' "$MENU_DIVIDER" "$MENU_RULE"
-    printf ' 当前状态: '
+    printf '当前状态: '
     print_major_status "$major"
     printf '\n\n'
-    read -r -p " 请输入数字[0-9]:" choice
+    read -r -p "请输入数字[0-9]:" choice
     case "$choice" in
       1)
         if [[ -n $i ]]; then warn "Snell v$major 已安装：${INST_UNIT[$i]}"; else deploy_major "$major"; fi
@@ -807,7 +825,7 @@ major_menu() {
         if [[ -n $i ]]; then view_instance "$i"; else warn "Snell v$major 尚未安装。"; fi
         ;;
       9)
-        if [[ -n $i ]]; then "$SYSTEMCTL_BIN" status "${INST_UNIT[$i]}" --no-pager || true; else warn "Snell v$major 尚未安装。"; fi
+        if [[ -n $i ]]; then view_instance_status "$i"; else warn "Snell v$major 尚未安装。"; fi
         ;;
       00) return ;;
       *) warn "无效选项。" ;;
@@ -822,10 +840,10 @@ main_menu() {
     printf '\n%s\nSnell v5/v6 多实例管理器 v%s\n%s\n' "$MENU_RULE" "$SCRIPT_VERSION" "$MENU_RULE"
     printf '1.管理 Snell v5\n2.管理 Snell v6\n3.查看 当前配置\n'
     printf '%s\n 00. 退出脚本\n%s\n\n' "$MENU_DIVIDER" "$MENU_RULE"
-    printf ' 当前状态:\t'
+    printf '当前状态:\t\n'
     print_main_status
     printf '\n\n'
-    read -r -p " 请输入数字[0-9]:" choice
+    read -r -p "请输入数字[0-9]:" choice
     case "$choice" in
       1) major_menu 5 ;;
       2) major_menu 6 ;;

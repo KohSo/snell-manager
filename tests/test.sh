@@ -92,19 +92,22 @@ find_major_instance 6
 assert_eq "1" "$MAJOR_INDEX" "select instance by major version"
 INST_ACTIVE=(active inactive)
 discover_instances() { :; }
-main_output=$(printf '00\n' | main_menu)
+main_output=$(printf '00\n' | main_menu 2>&1)
 assert_contains "$main_output" "1.管理 Snell v5" "new main menu v5 entry"
 assert_contains "$main_output" "3.查看 当前配置" "new main menu current config entry"
 assert_contains "$main_output" "$MENU_RULE" "main menu xOS title rule"
 assert_contains "$main_output" "$MENU_DIVIDER" "main menu xOS divider"
 assert_contains "$main_output" "v5:" "mixed main status includes v5"
-assert_contains "$main_output" $'当前状态:\tv5:' "main status aligns v5 at tab stop"
-assert_contains "$main_output" $'\n\t\tv6:' "main status aligns v6 at same tab stop"
-major_output=$(printf '00\n' | major_menu 5)
+assert_contains "$main_output" $'当前状态:\t\nv5:' "main status places v5 on its own line"
+assert_contains "$main_output" $'\nv6:' "main status aligns v6 with v5"
+assert_contains "$(declare -f main_menu)" 'read -r -p "请输入数字[0-9]:"' "main menu uses requested input prompt"
+major_output=$(printf '00\n' | major_menu 5 2>&1)
 assert_contains "$major_output" "1.安装 Snell v5" "v5 management install entry"
 assert_contains "$major_output" "9.查看 运行状态" "version management status entry"
 assert_contains "$major_output" "$MENU_DIVIDER" "management uses xOS divider"
 assert_contains "$major_output" "00. 返回" "version management return entry"
+assert_contains "$major_output" $'\n当前状态: ' "management status has no leading indentation"
+assert_contains "$(declare -f major_menu)" 'read -r -p "请输入数字[0-9]:"' "management uses requested input prompt"
 
 INST_UNIT=(snell-v5.service snell-v6.service)
 INST_CONF=("$tmp/summary-v5.conf" "$tmp/v6.conf")
@@ -126,6 +129,60 @@ assert_contains "$view_output" $'IPv4 地址\t:' "instance configuration IPv4 fi
 assert_contains "$view_output" $'IPv6 地址\t:' "instance configuration IPv6 field"
 assert_contains "$view_output" "[信息]" "instance Surge information label"
 assert_contains "$view_output" "VM-TEST = snell, 203.0.113.10, 36894" "instance Surge line"
+
+INST_LISTEN=('0.0.0.0:36894' '0.0.0.0:37681,[::]:37681')
+edit_v5_output=$(printf '0\n\n' | edit_instance 0 2>&1)
+assert_contains "$edit_v5_output" "当前配置摘要" "v5 editor summary title"
+assert_contains "$edit_v5_output" "$CONFIG_RULE" "v5 editor summary rule"
+assert_contains "$edit_v5_output" "1. 端口: 36894" "v5 editor numbers current values"
+assert_contains "$edit_v5_output" "6. IPv6: false" "v5 editor IPv6 field"
+assert_contains "$edit_v5_output" "8. OBFS Host:" "v5 editor OBFS host field"
+assert_contains "$(declare -f edit_instance)" 'read -r -p "请输入修改项[0-9]:"' "configuration editor uses requested prompt"
+assert_contains "$edit_v5_output" "* 按回车返回主菜单 *" "configuration editor return prompt"
+
+edit_v6_output=$(printf '0\n\n' | edit_instance 1 2>&1)
+assert_contains "$edit_v6_output" "6. DNS IP 偏好: prefer-ipv4" "v6 editor DNS preference field"
+assert_contains "$edit_v6_output" "8. listen: 0.0.0.0:37681,[::]:37681" "v6 editor listen field"
+
+MANAGED_ETC="$tmp/managed-etc"
+MANAGED_LIB="$tmp/managed-lib"
+SYSTEMD_DIR="$tmp/systemd"
+INST_MAJOR=()
+port_free() { return 0; }
+deploy_v5_output=$(printf '\n\n\n\n\n\nN\n' | deploy_major 5 2>&1)
+deploy_source=$(declare -f deploy_major)
+assert_contains "$deploy_source" 'read -r -p "端口（默认 ${port}）: "' "install port prompt"
+assert_contains "$deploy_source" 'read -r -p "TCP Fast Open？[Y/n]: "' "v5 install TFO prompt"
+assert_contains "$deploy_source" 'read -r -p "IPv6：[y/N]: "' "v5 install IPv6 prompt"
+assert_contains "$deploy_v5_output" "端口: 2345" "deployment summary port label"
+assert_contains "$deploy_v5_output" "TFO: true" "deployment summary TFO label"
+assert_contains "$deploy_v5_output" "IPv6: false" "deployment summary IPv6 label"
+
+deploy_v6_output=$(printf '\n\n\n\n\n\nN\n' | deploy_major 6 2>&1)
+assert_contains "$deploy_source" 'read -r -p "TCP Fast Open[Y/n]: "' "v6 install TFO prompt"
+assert_contains "$deploy_source" 'read -r -p "DNS IP 偏好（默认 default）: "' "v6 install DNS preference prompt"
+assert_contains "$deploy_source" 'read -r -p "v6 mode（默认 default，可选 unshaped/unsafe-raw）: "' "v6 install mode prompt"
+
+INST_VERSION=(5.0.1)
+INST_MAJOR=(5)
+INST_BIN=("$tmp/snell-server")
+INST_UNIT=(snell-v5.service)
+update_output=$(printf 'N\n\n' | update_instance 0 2>&1)
+assert_contains "$update_output" "当前 v5.0.1；目标官方包 5.0.1。" "update confirmation versions"
+assert_contains "$(declare -f update_instance)" 'read -r -p "确认更新 [y/N]: "' "update confirmation prompt"
+assert_contains "$update_output" "* 按回车返回主菜单 *" "update return prompt"
+
+fake_systemctl() {
+  printf '%s\n' '● snell-v5.service - Snell v5 managed instance' \
+    '   Loaded: loaded (/etc/systemd/system/snell-v5.service; enabled)' \
+    '   Active: active (running)' \
+    ' Main PID: 1234 (snell-server)'
+}
+SYSTEMCTL_BIN=fake_systemctl
+status_output=$(printf '\n' | view_instance_status 0 2>&1)
+assert_contains "$status_output" "● snell-v5.service - Snell v5 managed instance" "status page service output"
+assert_contains "$status_output" "$CONFIG_RULE" "status page rule"
+assert_contains "$status_output" "* 按回车返回主菜单 *" "status page return prompt"
 
 if ((failures)); then
   printf '%s test(s) failed\n' "$failures" >&2
