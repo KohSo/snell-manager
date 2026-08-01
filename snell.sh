@@ -1,0 +1,584 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_VERSION="1.0.0"
+OFFICIAL_BASE="https://dl.nssurge.com/snell"
+MANAGED_ETC="/etc/snell-instances"
+MANAGED_LIB="/usr/local/lib/snell"
+SYSTEMD_DIR="/etc/systemd/system"
+SYSTEMCTL_BIN="${SNELL_SYSTEMCTL:-systemctl}"
+SS_BIN="${SNELL_SS:-ss}"
+
+V5_VERSION="5.0.1"
+V6_PACKAGE_VERSION="6.0.0rc"
+V5_AMD64_SHA256="5b2e221f2c6e29b1db8e47053e1221be29d5627da807cb932b089f514a3609f0"
+V6_AMD64_SHA256="02fa15ac1e18cde6a3e072eeb5d15328c7fd759dbefb1e77e33891a71a1202ae"
+
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+RESET='\033[0m'
+
+declare -a INST_UNIT=() INST_BIN=() INST_CONF=() INST_VERSION=() INST_MAJOR=()
+declare -a INST_PORT=() INST_LISTEN=() INST_ACTIVE=() INST_ENABLED=() INST_MANAGED=()
+
+info() { printf "%b[信息]%b %s\n" "$GREEN" "$RESET" "$*"; }
+warn() { printf "%b[提示]%b %s\n" "$YELLOW" "$RESET" "$*" >&2; }
+die() { printf "%b[错误]%b %s\n" "$RED" "$RESET" "$*" >&2; exit 1; }
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 或 sudo 运行。"
+}
+
+require_supported_system() {
+  [[ -r /etc/os-release ]] || die "无法识别操作系统。"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  [[ "${ID:-}" == "debian" ]] || die "v1.0 仅正式支持 Debian 12/13。"
+  [[ "${VERSION_ID:-}" == "12" || "${VERSION_ID:-}" == "13" ]] || \
+    die "v1.0 仅正式支持 Debian 12/13，当前为 ${PRETTY_NAME:-unknown}。"
+  [[ $(uname -m) == "x86_64" ]] || die "v1.0 仅正式支持 x86_64。"
+  command -v "$SYSTEMCTL_BIN" >/dev/null || die "未找到 systemctl。"
+  command -v "$SS_BIN" >/dev/null || die "未找到 ss。"
+}
+
+trim() {
+  local value=${1-}
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+config_value() {
+  local file=$1 key=$2
+  awk -v wanted="$key" '
+    /^[[:space:]]*#/ { next }
+    {
+      line=$0
+      pos=index(line,"=")
+      if (!pos) next
+      k=substr(line,1,pos-1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k==wanted) {
+        v=substr(line,pos+1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        print v
+        exit
+      }
+    }
+  ' "$file" 2>/dev/null || true
+}
+
+extract_port() {
+  local listen=$1 first
+  first=${listen%%,*}
+  if [[ $first =~ :([0-9]+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+replace_listen_port() {
+  local listen=$1 port=$2 part out=""
+  IFS=',' read -r -a parts <<< "$listen"
+  for part in "${parts[@]}"; do
+    part=$(trim "$part")
+    part=$(sed -E "s/:[0-9]+$/:${port}/" <<< "$part")
+    [[ -n $out ]] && out+=","
+    out+="$part"
+  done
+  printf '%s' "$out"
+}
+
+binary_version() {
+  local bin=$1 output
+  [[ -x $bin ]] || return 0
+  output=$($bin --version 2>&1 || true)
+  sed -nE 's/.*snell-server v([0-9]+([.][0-9A-Za-z]+)*).*/\1/p' <<< "$output" | head -n1
+}
+
+major_from_version() {
+  local version=$1
+  [[ $version =~ ^([0-9]+) ]] && printf '%s' "${BASH_REMATCH[1]}"
+}
+
+unit_exec_line() {
+  "$SYSTEMCTL_BIN" cat "$1" 2>/dev/null | awk -F= '/^[[:space:]]*ExecStart=/ { line=substr($0,index($0,"=")+1) } END { print line }'
+}
+
+parse_exec_line() {
+  local line=$1 token previous="" bin="" conf=""
+  read -r -a tokens <<< "$line"
+  for token in "${tokens[@]}"; do
+    token=${token#\"}; token=${token%\"}
+    if [[ -z $bin && $token == /* ]]; then bin=$token; fi
+    if [[ $previous == "-c" ]]; then conf=$token; break; fi
+    previous=$token
+  done
+  printf '%s\t%s\n' "$bin" "$conf"
+}
+
+add_instance() {
+  local unit=$1 bin=$2 conf=$3 key version major listen port active enabled managed i
+  [[ -n $bin && -n $conf && -f $conf ]] || return 0
+  key="$bin|$conf"
+  for i in "${!INST_BIN[@]}"; do
+    [[ "${INST_BIN[$i]}|${INST_CONF[$i]}" == "$key" ]] && return 0
+  done
+  version=$(binary_version "$bin")
+  [[ -n $version ]] || version=$(config_value "$conf" version)
+  major=$(major_from_version "$version")
+  [[ $major == 5 || $major == 6 ]] || return 0
+  listen=$(config_value "$conf" listen)
+  port=$(extract_port "$listen")
+  active=$($SYSTEMCTL_BIN is-active "$unit" 2>/dev/null || true)
+  enabled=$($SYSTEMCTL_BIN is-enabled "$unit" 2>/dev/null || true)
+  managed=no
+  [[ $conf == "$MANAGED_ETC"/* ]] && managed=yes
+  INST_UNIT+=("$unit"); INST_BIN+=("$bin"); INST_CONF+=("$conf")
+  INST_VERSION+=("$version"); INST_MAJOR+=("$major"); INST_PORT+=("$port")
+  INST_LISTEN+=("$listen"); INST_ACTIVE+=("$active"); INST_ENABLED+=("$enabled")
+  INST_MANAGED+=("$managed")
+}
+
+discover_instances() {
+  INST_UNIT=(); INST_BIN=(); INST_CONF=(); INST_VERSION=(); INST_MAJOR=()
+  INST_PORT=(); INST_LISTEN=(); INST_ACTIVE=(); INST_ENABLED=(); INST_MANAGED=()
+  local unit line parsed bin conf
+  mapfile -t units < <(
+    {
+      "$SYSTEMCTL_BIN" list-units --type=service --state=running --no-legend --plain 2>/dev/null || true
+      "$SYSTEMCTL_BIN" list-unit-files --type=service --no-legend 2>/dev/null || true
+    } | awk 'tolower($1) ~ /snell/ {print $1}' | awk '!seen[$0]++'
+  )
+  for unit in "${units[@]}"; do
+    line=$(unit_exec_line "$unit")
+    [[ $line == *snell-server* ]] || continue
+    parsed=$(parse_exec_line "$line")
+    bin=${parsed%%$'\t'*}; conf=${parsed#*$'\t'}
+    add_instance "$unit" "$bin" "$conf"
+  done
+}
+
+state_word() {
+  [[ $1 == active ]] && printf "%b运行中%b" "$GREEN" "$RESET" || printf "%b已停止%b" "$RED" "$RESET"
+}
+
+print_instances() {
+  local i
+  printf '\n%-4s %-23s %-9s %-9s %-8s %-10s %s\n' "编号" "服务" "版本" "端口" "托管" "状态" "配置"
+  printf '%s\n' "------------------------------------------------------------------------------------------------"
+  for i in "${!INST_UNIT[@]}"; do
+    printf '%-4s %-23s %-9s %-9s %-8s %-20b %s\n' "$((i+1))" "${INST_UNIT[$i]}" \
+      "v${INST_VERSION[$i]}" "${INST_PORT[$i]:--}" "${INST_MANAGED[$i]}" \
+      "$(state_word "${INST_ACTIVE[$i]}")" "${INST_CONF[$i]}"
+  done
+  ((${#INST_UNIT[@]})) || warn "未发现 Snell v5/v6 systemd 实例。"
+}
+
+redacted_config() {
+  sed -E 's/^([[:space:]]*psk[[:space:]]*=[[:space:]]*).*/\1[REDACTED]/I' "$1"
+}
+
+audit() {
+  discover_instances
+  printf 'Snell Manager v%s 只读审计\n' "$SCRIPT_VERSION"
+  # shellcheck disable=SC1091
+  printf '主机: %s | 系统: %s | 架构: %s\n' "$(hostname)" "$(. /etc/os-release; printf '%s %s' "$ID" "$VERSION_ID")" "$(uname -m)"
+  print_instances
+  local i proto
+  for i in "${!INST_UNIT[@]}"; do
+    printf '\n[%s] 配置（PSK 已遮盖）\n' "${INST_UNIT[$i]}"
+    redacted_config "${INST_CONF[$i]}"
+    printf '监听核验:\n'
+    "$SS_BIN" -lntup 2>/dev/null | awk -v p=":${INST_PORT[$i]}" 'index($0,p) {print}' || true
+    proto=tcp
+    [[ ${INST_MAJOR[$i]} == 5 ]] && proto="tcp+udp"
+    printf '预期传输: %s\n' "$proto"
+  done
+}
+
+public_ipv4() {
+  local ip=""
+  if command -v curl >/dev/null; then
+    ip=$(curl -4fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
+  elif command -v wget >/dev/null; then
+    ip=$(wget -4qO- -T 4 https://api.ipify.org 2>/dev/null || true)
+  fi
+  printf '%s' "$ip"
+}
+
+view_instance() {
+  local i=$1 psk ip mode line
+  printf '\nSnell 实例配置：\n'
+  printf '服务: %s\n二进制: %s\n配置: %s\n状态: %s / %s\n' \
+    "${INST_UNIT[$i]}" "${INST_BIN[$i]}" "${INST_CONF[$i]}" \
+    "${INST_ACTIVE[$i]}" "${INST_ENABLED[$i]}"
+  printf '%s\n' "------------------------------------------------------------"
+  cat "${INST_CONF[$i]}"
+  printf '%s\n' "------------------------------------------------------------"
+  psk=$(config_value "${INST_CONF[$i]}" psk)
+  ip=$(public_ipv4)
+  mode=$(config_value "${INST_CONF[$i]}" mode)
+  if [[ -n $ip && -n $psk && -n ${INST_PORT[$i]} ]]; then
+    line="$(hostname) v${INST_MAJOR[$i]} = snell, $ip, ${INST_PORT[$i]}, psk=$psk, version=${INST_MAJOR[$i]}"
+    [[ ${INST_MAJOR[$i]} == 6 && -n $mode ]] && line+=", mode=$mode"
+    printf 'Surge 配置：\n%s\n' "$line"
+  else
+    warn "无法生成完整 Surge 配置，请检查公网 IPv4、端口或 PSK。"
+  fi
+}
+
+port_free() {
+  local port=$1 ignore=${2:-}
+  [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || return 1
+  [[ $port == "$ignore" ]] && return 0
+  ! "$SS_BIN" -H -lntup 2>/dev/null | awk -v p=":$port" '$5 ~ p"$" {found=1} END{exit !found}'
+}
+
+random_port() {
+  local candidate
+  for _ in $(seq 1 200); do
+    candidate=$((10000 + 0x$(od -An -N2 -tx2 /dev/urandom | tr -d ' ') % 50001))
+    if port_free "$candidate"; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+random_psk() {
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n' | cut -c1-32
+}
+
+write_key_to_temp() {
+  local source=$1 dest=$2 key=$3 value=$4
+  awk -v wanted="$key" -v replacement="$value" '
+    BEGIN {done=0}
+    {
+      line=$0; pos=index(line,"=")
+      if ($0 !~ /^[[:space:]]*#/ && pos) {
+        k=substr(line,1,pos-1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+        if (k==wanted) {print wanted " = " replacement; done=1; next}
+      }
+      print
+    }
+    END {if (!done) print wanted " = " replacement}
+  ' "$source" > "$dest"
+}
+
+apply_config_change() {
+  local i=$1 key=$2 value=$3 conf unit tmp backup stamp
+  conf=${INST_CONF[$i]}; unit=${INST_UNIT[$i]}
+  stamp=$(date +%Y%m%d-%H%M%S)
+  backup="${conf}.backup-${stamp}"
+  tmp=$(mktemp "${conf}.tmp.XXXXXX")
+  write_key_to_temp "$conf" "$tmp" "$key" "$value"
+  chmod --reference="$conf" "$tmp" 2>/dev/null || chmod 600 "$tmp"
+  cp -a "$conf" "$backup"
+  mv "$tmp" "$conf"
+  if "$SYSTEMCTL_BIN" restart "$unit" && "$SYSTEMCTL_BIN" is-active --quiet "$unit"; then
+    info "配置已更新；备份为 $backup"
+    return 0
+  fi
+  warn "新配置启动失败，正在恢复。"
+  cp -a "$backup" "$conf"
+  "$SYSTEMCTL_BIN" restart "$unit" || true
+  "$SYSTEMCTL_BIN" is-active --quiet "$unit" || die "回滚后服务仍未恢复，请检查 $unit。"
+  die "已回滚本次配置修改。"
+}
+
+edit_instance() {
+  local i=$1 choice key value port current
+  printf '\n1. 端口\n2. PSK\n3. TFO\n4. DNS\n5. 出口接口\n'
+  if [[ ${INST_MAJOR[$i]} == 5 ]]; then
+    printf '6. IPv6 解析\n7. OBFS\n8. OBFS Host\n'
+  else
+    printf '6. DNS IP 偏好\n7. mode\n8. listen（完整值）\n'
+  fi
+  read -r -p "选择配置项: " choice
+  case "$choice" in
+    1)
+      read -r -p "新端口: " port
+      current=${INST_PORT[$i]}
+      port_free "$port" "$current" || die "端口无效或已被占用。"
+      key=listen; value=$(replace_listen_port "${INST_LISTEN[$i]}" "$port")
+      ;;
+    2)
+      key=psk; read -r -p "新 PSK（留空生成32位随机值）: " value; [[ -n $value ]] || value=$(random_psk)
+      if [[ ${INST_MAJOR[$i]} == 6 ]]; then
+        [[ ${#value} -ge 16 && ${#value} -le 255 ]] || die "v6 PSK 必须为 16–255 位。"
+      else
+        [[ ${#value} -ge 12 && ${#value} -le 255 ]] || die "v5 PSK 必须为 12–255 位。"
+      fi
+      ;;
+    3) key=tfo; read -r -p "true/false: " value; [[ $value == true || $value == false ]] || die "只能输入 true 或 false。" ;;
+    4) key=dns; read -r -p "DNS（逗号分隔）: " value; [[ -n $value ]] || die "DNS 不能为空。" ;;
+    5) key=egress-interface; read -r -p "出口接口: " value; [[ -n $value ]] || die "出口接口不能为空。" ;;
+    6)
+      if [[ ${INST_MAJOR[$i]} == 5 ]]; then
+        key=ipv6; read -r -p "true/false: " value; [[ $value == true || $value == false ]] || die "只能输入 true 或 false。"
+      else
+        key=dns-ip-preference; read -r -p "default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only: " value
+        [[ $value =~ ^(default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only)$ ]] || die "无效值。"
+      fi
+      ;;
+    7)
+      if [[ ${INST_MAJOR[$i]} == 5 ]]; then
+        key=obfs; read -r -p "off/http: " value; [[ $value == off || $value == http ]] || die "无效值。"
+      else
+        key=mode; read -r -p "default/unshaped/unsafe-raw: " value
+        [[ $value =~ ^(default|unshaped|unsafe-raw)$ ]] || die "无效值。"
+        [[ $value != unsafe-raw ]] || { read -r -p "unsafe-raw 为明文，仅输入 UNSAFE 确认: " choice; [[ $choice == UNSAFE ]] || die "已取消。"; }
+      fi
+      ;;
+    8)
+      if [[ ${INST_MAJOR[$i]} == 5 ]]; then key=obfs-host; else key=listen; fi
+      read -r -p "新值: " value; [[ -n $value ]] || die "值不能为空。"
+      if [[ $key == listen ]]; then
+        port=$(extract_port "$value")
+        [[ -n $port ]] || die "listen 必须包含端口。"
+        while IFS= read -r current; do
+          [[ $(extract_port "$current") == "$port" ]] || die "v1.0 要求多个监听地址使用同一端口。"
+        done < <(tr ',' '\n' <<< "$value")
+        port_free "$port" "${INST_PORT[$i]}" || die "listen 端口已被占用。"
+      fi
+      ;;
+    *) die "无效选项。" ;;
+  esac
+  printf '将修改 %s: %s = %s\n' "${INST_UNIT[$i]}" "$key" "$value"
+  read -r -p "确认并重启该实例？[y/N]: " choice
+  [[ $choice =~ ^[Yy]$ ]] || { info "已取消。"; return; }
+  apply_config_change "$i" "$key" "$value"
+}
+
+download_official() {
+  local major=$1 dest=$2 version url expected archive extracted actual
+  command -v unzip >/dev/null || die "缺少 unzip，请先安装：apt-get install unzip"
+  if [[ $major == 5 ]]; then
+    version=$V5_VERSION; expected=$V5_AMD64_SHA256
+  else
+    version=$V6_PACKAGE_VERSION; expected=$V6_AMD64_SHA256
+  fi
+  url="$OFFICIAL_BASE/snell-server-v${version}-linux-amd64.zip"
+  archive="$dest/package.zip"; extracted="$dest/extracted"
+  mkdir -p "$extracted"
+  if command -v curl >/dev/null; then
+    curl -fsSL --proto '=https' --tlsv1.2 "$url" -o "$archive"
+  elif command -v wget >/dev/null; then
+    wget -qO "$archive" "$url"
+  else
+    die "缺少 curl 或 wget。"
+  fi
+  unzip -q "$archive" -d "$extracted"
+  [[ -f $extracted/snell-server ]] || die "官方压缩包中未找到 snell-server。"
+  actual=$(sha256sum "$extracted/snell-server" | awk '{print $1}')
+  [[ $actual == "$expected" ]] || die "SHA-256 不匹配，拒绝安装。"
+  install -m 0755 "$extracted/snell-server" "$dest/snell-server"
+}
+
+firewall_offer() {
+  local major=$1 port=$2 answer
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    read -r -p "UFW 已启用，放行 $port/tcp$([[ $major == 5 ]] && printf ' 和 udp')？[Y/n]: " answer
+    [[ -n $answer ]] || answer=y
+    if [[ $answer =~ ^[Yy]$ ]]; then ufw allow "$port/tcp"; [[ $major == 5 ]] && ufw allow "$port/udp"; fi
+  elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
+    read -r -p "firewalld 已启用，放行新端口？[Y/n]: " answer
+    [[ -n $answer ]] || answer=y
+    if [[ $answer =~ ^[Yy]$ ]]; then
+      firewall-cmd --permanent --add-port="$port/tcp"
+      [[ $major == 5 ]] && firewall-cmd --permanent --add-port="$port/udp"
+      firewall-cmd --reload
+    fi
+  else
+    info "未检测到启用的 UFW/firewalld；未修改防火墙。"
+  fi
+}
+
+deploy_major() {
+  local major=$1
+  local unit="snell-v${major}.service" etcdir="$MANAGED_ETC/v${major}"
+  local libdir="$MANAGED_LIB/v${major}"
+  local conf="$etcdir/config.conf" bin="$libdir/snell-server"
+  local unitfile="$SYSTEMD_DIR/$unit" port psk choice stage committed=0
+  local i
+  for i in "${!INST_MAJOR[@]}"; do [[ ${INST_MAJOR[$i]} != "$major" ]] || die "已存在 v$major 实例：${INST_UNIT[$i]}"; done
+  [[ ! -e $unitfile && ! -e $etcdir && ! -e $libdir ]] || die "目标路径已存在，拒绝覆盖：v$major"
+  port=$(random_port) || die "未能找到空闲端口。"
+  read -r -p "监听端口（默认 $port）: " choice; [[ -z $choice ]] || port=$choice
+  port_free "$port" || die "端口无效或已被占用。"
+  psk=$(random_psk)
+  read -r -p "PSK（留空生成独立32位随机值）: " choice; [[ -z $choice ]] || psk=$choice
+  [[ ${#psk} -ge 16 && ${#psk} -le 255 ]] || die "PSK 必须为 16–255 位。"
+  printf '\n将新增 v%s：服务=%s 端口=%s，不修改现有实例。\n' "$major" "$unit" "$port"
+  read -r -p "确认部署？[y/N]: " choice
+  [[ $choice =~ ^[Yy]$ ]] || { info "已取消。"; return; }
+  stage=$(mktemp -d /tmp/snell-manager.XXXXXX)
+  cleanup_deploy() {
+    local rc=$?
+    rm -f "$stage/package.zip" "$stage/snell-server" "$stage/extracted/snell-server" 2>/dev/null || true
+    rmdir "$stage/extracted" "$stage" 2>/dev/null || true
+    if [[ $rc -ne 0 && $committed -eq 0 ]]; then
+      "$SYSTEMCTL_BIN" disable --now "$unit" >/dev/null 2>&1 || true
+      rm -f "$unitfile" "$conf" "$bin" 2>/dev/null || true
+      rmdir "$etcdir" "$libdir" 2>/dev/null || true
+      "$SYSTEMCTL_BIN" daemon-reload >/dev/null 2>&1 || true
+    fi
+    trap - RETURN EXIT
+    return "$rc"
+  }
+  trap cleanup_deploy RETURN EXIT
+  download_official "$major" "$stage"
+  install -d -m 0700 "$etcdir"
+  install -d -m 0755 "$libdir"
+  install -m 0755 "$stage/snell-server" "$bin"
+  umask 077
+  if [[ $major == 5 ]]; then
+    printf '%s\n' '[snell-server]' "listen = 0.0.0.0:$port" "psk = $psk" \
+      'ipv6 = false' 'obfs = off' 'tfo = true' \
+      'dns = 1.1.1.1, 8.8.8.8, 2001:4860:4860::8888' 'version = 5' > "$conf"
+  else
+    printf '%s\n' '[snell-server]' "listen = 0.0.0.0:$port,[::]:$port" "psk = $psk" \
+      'tfo = true' 'dns = 1.1.1.1, 8.8.8.8, 2001:4860:4860::8888' \
+      'dns-ip-preference = default' 'mode = default' 'version = 6' > "$conf"
+  fi
+  chmod 600 "$conf"
+  umask 022
+  printf '%s\n' '[Unit]' "Description=Snell v$major managed instance" \
+    'After=network-online.target' 'Wants=network-online.target' '' '[Service]' \
+    'Type=simple' 'User=root' 'LimitNOFILE=32768' \
+    "ExecStart=$bin -c $conf" 'Restart=on-failure' 'RestartSec=5s' '' '[Install]' \
+    'WantedBy=multi-user.target' > "$unitfile"
+  chmod 644 "$unitfile"
+  "$SYSTEMCTL_BIN" daemon-reload
+  "$SYSTEMCTL_BIN" enable --now "$unit"
+  sleep 1
+  "$SYSTEMCTL_BIN" is-active --quiet "$unit" || { "$SYSTEMCTL_BIN" status "$unit" --no-pager || true; return 1; }
+  "$SS_BIN" -H -lnt 2>/dev/null | grep -q ":$port " || die "未发现 $port/TCP 监听。"
+  if [[ $major == 5 ]]; then "$SS_BIN" -H -lnu 2>/dev/null | grep -q ":$port " || die "未发现 $port/UDP 监听。"; fi
+  committed=1
+  firewall_offer "$major" "$port"
+  info "v$major 已部署并设为开机启动。"
+  printf 'PSK: %s\n' "$psk"
+  discover_instances
+}
+
+update_instance() {
+  local i=$1 major=${INST_MAJOR[$1]} bin=${INST_BIN[$1]} unit=${INST_UNIT[$1]}
+  local stage backup choice expected_version current
+  current=${INST_VERSION[$i]}
+  expected_version=$([[ $major == 5 ]] && printf '%s' "$V5_VERSION" || printf '%s' "$V6_PACKAGE_VERSION")
+  printf '当前 v%s；目标官方包 %s。将只更新 %s。\n' "$current" "$expected_version" "$unit"
+  read -r -p "继续？[y/N]: " choice
+  [[ $choice =~ ^[Yy]$ ]] || return 0
+  stage=$(mktemp -d /tmp/snell-manager-update.XXXXXX)
+  download_official "$major" "$stage"
+  backup="${bin}.backup-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$bin" "$backup"
+  install -m 0755 "$stage/snell-server" "$bin"
+  if "$SYSTEMCTL_BIN" restart "$unit" && "$SYSTEMCTL_BIN" is-active --quiet "$unit"; then
+    info "更新成功；旧二进制保留为 $backup"
+  else
+    warn "更新失败，恢复旧二进制。"
+    cp -a "$backup" "$bin"
+    "$SYSTEMCTL_BIN" restart "$unit" || true
+    die "更新已回滚。"
+  fi
+}
+
+remove_managed_instance() {
+  local i=$1 confirm unit conf bin
+  [[ ${INST_MANAGED[$i]} == yes ]] || die "旧实例只原地管理，不允许脚本删除。"
+  unit=${INST_UNIT[$i]}; conf=${INST_CONF[$i]}; bin=${INST_BIN[$i]}
+  read -r -p "输入服务名 $unit 确认卸载: " confirm
+  [[ $confirm == "$unit" ]] || die "确认不匹配，已取消。"
+  "$SYSTEMCTL_BIN" disable --now "$unit"
+  rm -f "$SYSTEMD_DIR/$unit" "$conf" "$bin"
+  rmdir "${conf%/*}" "${bin%/*}" 2>/dev/null || true
+  "$SYSTEMCTL_BIN" daemon-reload
+  info "已删除脚本托管实例 $unit；该操作不恢复防火墙规则。"
+  discover_instances
+}
+
+select_instance() {
+  local selection
+  ((${#INST_UNIT[@]})) || return 1
+  read -r -p "实例编号: " selection
+  [[ $selection =~ ^[0-9]+$ && $selection -ge 1 && $selection -le ${#INST_UNIT[@]} ]] || die "无效编号。"
+  SELECTED_INDEX=$((selection-1))
+}
+
+instance_menu() {
+  local i=$1 choice
+  while true; do
+    printf '\n[%s / v%s / %s]\n' "${INST_UNIT[$i]}" "${INST_VERSION[$i]}" "${INST_ACTIVE[$i]}"
+    printf '1. 查看配置与 Surge 节点\n2. 启动\n3. 停止\n4. 重启\n5. 查看状态\n6. 查看日志\n7. 修改配置\n8. 同版本更新\n9. 卸载脚本托管实例\n0. 返回\n'
+    read -r -p "选择: " choice
+    case "$choice" in
+      1) view_instance "$i" ;;
+      2) "$SYSTEMCTL_BIN" start "${INST_UNIT[$i]}" ;;
+      3) "$SYSTEMCTL_BIN" stop "${INST_UNIT[$i]}" ;;
+      4) "$SYSTEMCTL_BIN" restart "${INST_UNIT[$i]}" ;;
+      5) "$SYSTEMCTL_BIN" status "${INST_UNIT[$i]}" --no-pager || true ;;
+      6) journalctl -u "${INST_UNIT[$i]}" -n 50 --no-pager | sed -E 's/(psk[=: ]+)[^ ,]+/\1[REDACTED]/Ig' ;;
+      7) edit_instance "$i"; discover_instances; return ;;
+      8) update_instance "$i"; discover_instances; return ;;
+      9) remove_managed_instance "$i"; return ;;
+      0) return ;;
+      *) warn "无效选项。" ;;
+    esac
+    discover_instances
+    for i in "${!INST_UNIT[@]}"; do [[ ${INST_UNIT[$i]} == "${INST_UNIT[$SELECTED_INDEX]:-}" ]] && break; done
+  done
+}
+
+main_menu() {
+  local choice missing5=yes missing6=yes i
+  while true; do
+    discover_instances
+    for i in "${!INST_MAJOR[@]}"; do [[ ${INST_MAJOR[$i]} == 5 ]] && missing5=no; [[ ${INST_MAJOR[$i]} == 6 ]] && missing6=no; done
+    printf '\n=============================================\nSnell v5/v6 多实例管理器 v%s\n=============================================\n' "$SCRIPT_VERSION"
+    print_instances
+    printf '\n1. 管理现有实例\n2. 部署缺少的互补版本\n3. 只读审计\n0. 退出\n'
+    read -r -p "选择: " choice
+    case "$choice" in
+      1) select_instance && instance_menu "$SELECTED_INDEX" ;;
+      2)
+        missing5=yes; missing6=yes
+        for i in "${!INST_MAJOR[@]}"; do [[ ${INST_MAJOR[$i]} == 5 ]] && missing5=no; [[ ${INST_MAJOR[$i]} == 6 ]] && missing6=no; done
+        if [[ $missing5 == yes && $missing6 == yes ]]; then
+          read -r -p "部署 v5 或 v6？[5/6]: " choice; [[ $choice == 5 || $choice == 6 ]] || die "无效版本。"; deploy_major "$choice"
+        elif [[ $missing5 == yes ]]; then deploy_major 5
+        elif [[ $missing6 == yes ]]; then deploy_major 6
+        else info "v5 与 v6 均已存在，无需再部署。"
+        fi
+        ;;
+      3) audit ;;
+      0) exit 0 ;;
+      *) warn "无效选项。" ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+用法: sudo ./snell.sh [--audit|--help]
+
+  无参数     打开交互式管理菜单
+  --audit    只读发现并检查当前 Snell v5/v6 实例（PSK 遮盖）
+  --help     显示帮助
+EOF
+}
+
+main() {
+  require_root
+  require_supported_system
+  case ${1:-} in
+    --audit) audit ;;
+    --help|-h) usage ;;
+    "") main_menu ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+if [[ ${SNELL_TEST_MODE:-0} != 1 ]]; then
+  main "$@"
+fi
