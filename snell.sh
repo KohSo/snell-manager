@@ -275,6 +275,15 @@ yes_no_value() {
   fi
 }
 
+deploy_confirmation_value() {
+  local value=${1-}
+  case $value in
+    ""|[Yy]) printf 'confirm' ;;
+    [Nn]|00) printf 'cancel' ;;
+    *) printf 'invalid' ;;
+  esac
+}
+
 surge_endpoint() {
   local endpoint=$1
   if [[ $endpoint == *:* && $endpoint != \[*\] ]]; then
@@ -917,10 +926,10 @@ deploy_major() {
     printf 'DNS IP 偏好: %s\nmode: %s\n' "$dns_ip_pref" "$mode"
   fi
   while true; do
-    prompt_read choice "确认部署？[y/N]: "
-    case $choice in
-      [Yy]) break ;;
-      ""|[Nn]|00) cancel_install; return 0 ;;
+    prompt_read choice "确认部署？[Y/n]: "
+    case $(deploy_confirmation_value "$choice") in
+      confirm) break ;;
+      cancel) cancel_install; return 0 ;;
       *) warn "请输入 y 或 n。" ;;
     esac
   done

@@ -79,6 +79,11 @@ assert_eq "[REDACTED]" "$(redacted_config "$tmp/config.conf" | awk -F'= ' '/psk/
 assert_eq '[2001:db8::1]' "$(surge_endpoint '2001:db8::1')" "bracket IPv6 client endpoint"
 assert_eq "true" "$(yes_no_value '' true)" "blank yes/no keeps true default"
 assert_eq "false" "$(yes_no_value '' false)" "blank yes/no keeps false default"
+assert_eq "confirm" "$(deploy_confirmation_value '')" "blank deployment confirmation proceeds"
+assert_eq "confirm" "$(deploy_confirmation_value Y)" "explicit yes confirms deployment"
+assert_eq "cancel" "$(deploy_confirmation_value N)" "negative deployment confirmation cancels"
+assert_eq "cancel" "$(deploy_confirmation_value 00)" "00 deployment confirmation cancels"
+assert_eq "invalid" "$(deploy_confirmation_value maybe)" "invalid deployment confirmation retries"
 assert_eq 'node = snell, 203.0.113.10, 11967, psk=secret, version=5, tfo=true, reuse=true, ecn=true' \
   "$(build_surge_line node 203.0.113.10 11967 secret 5 '' '' '' true true true)" \
   "xOS-style native v5 client line"
@@ -201,7 +206,6 @@ assert_eq "unshaped" "$INSTALL_MODE" "unconfirmed unsafe-raw returns to mode sel
 
 port_free() { return 0; }
 deploy_v5_output=$(printf '\n\n\n\n\n\nN\n' | deploy_major 5 2>&1)
-deploy_source=$(declare -f deploy_major)
 assert_contains "$deploy_v5_output" "请输入 Snell Server 端口" "xOS-style install port prompt"
 assert_contains "$deploy_v5_output" "请输入 Snell Server 密钥" "xOS-style install PSK prompt"
 assert_contains "$deploy_v5_output" "配置 OBFS" "xOS-style v5 OBFS prompt"
@@ -214,6 +218,7 @@ assert_contains "$deploy_v5_output" "TFO: true" "deployment summary TFO label"
 assert_contains "$deploy_v5_output" "IPv6: false" "deployment summary IPv6 label"
 assert_contains "$deploy_v5_output" "PSK: " "deployment summary includes PSK"
 assert_not_contains "$deploy_v5_output" "PSK: [已设置" "deployment summary does not mask PSK"
+assert_contains "$deploy_v5_output" "确认部署？[Y/n]: " "deployment confirmation defaults to yes"
 assert_before "$deploy_v5_output" "配置 OBFS" "是否开启 IPv6 解析？" "v5 OBFS precedes IPv6"
 assert_before "$deploy_v5_output" "是否开启 IPv6 解析？" "是否开启 TCP Fast Open？" "v5 IPv6 precedes TFO"
 assert_before "$deploy_v5_output" "是否开启 TCP Fast Open？" "请输入正确格式的 DNS" "v5 TFO precedes DNS"
